@@ -38,7 +38,9 @@ param(
     [string]   $BaseDatos  = 'AC_PRODUCCION',
     [switch]   $HistorialSiempre,
     [string]   $Salida,
-    [int]      $MaxReintentos = 2
+    [int]      $MaxReintentos = 2,
+    [ValidateRange(1, 12)]
+    [int]      $Instancias = 1
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,6 +49,7 @@ $raiz = Split-Path -Parent $MyInvocation.MyCommand.Path
 . "$raiz\lib\Win32.ps1"
 . "$raiz\lib\Remote.ps1"
 . "$raiz\lib\AC.ps1"
+. "$raiz\lib\ACParalelo.ps1"
 . "$raiz\lib\Excel.ps1"
 
 $dirEntrada = Join-Path $raiz 'entrada'
@@ -176,80 +179,66 @@ function New-Registro {
 # ---------------------------------------------------------------------
 
 Write-Titulo "PASADA 1 - ESTADO DE CADA NUMERO"
-Write-Host "No mover el raton ni el teclado mientras corre: AC se maneja con clics reales." -ForegroundColor Yellow
+Write-Host "AC se maneja por mensajes, pero necesita el primer plano en cada clic:" -ForegroundColor Yellow
+Write-Host "sus ventanas van a saltar al frente. No uses el equipo mientras corre." -ForegroundColor Yellow
 Write-Host ""
 
-$ctx = Start-ACSession -Password $clave -BaseDatos $BaseDatos
-$i = 0
-foreach ($num in $listaNumeros) {
-    $i++
-    Write-Host ("[{0}/{1}] {2}" -f $i, $listaNumeros.Count, $num) -ForegroundColor White
-    $reg = New-Registro -Numero $num
-    $intento = 0
-    $listo = $false
+# ojo: no llamar a esta variable $instancias, PowerShell no distingue
+# mayusculas y pisaria el parametro -Instancias del script
+$pool = Start-ACInstancias -Cantidad $Instancias -Password $clave -BaseDatos $BaseDatos
+Write-Host ""
 
-    while (-not $listo -and $intento -le $MaxReintentos) {
-        $intento++
-        try {
-            if (-not (Get-ACProcess)) {
-                Write-Paso "AC no esta en ejecucion; reiniciando sesion..." "WARN"
-                $ctx = Start-ACSession -Password $clave -BaseDatos $BaseDatos
-            }
-            $r = Invoke-ACBusqueda -Numero $num
+$hechos = 0
+$total  = $listaNumeros.Count
+$porNumero = @{}
 
-            if (-not $r.Encontrado) {
-                $reg.ENCONTRADO = 'NO'
-                $reg.ACTIVA     = 'NO'
-                $reg.ESTADO     = 'NO ENCONTRADO'
-                $reg.MOTIVO     = $r.Mensaje
-                $reg.OBSERVACION= 'AC no devolvio ninguna linea para este numero.'
-                Write-Paso "No encontrado. $($r.Mensaje)" "WARN"
-            } else {
-                # si el cliente tiene varias lineas, se toma la del numero consultado
-                $fila = $r.Filas | Where-Object { ($_.Campos.MIN -replace '[^0-9]','') -eq $num } | Select-Object -First 1
-                if (-not $fila) { $fila = $r.Filas[0] }
-                $c = $fila.Campos
+$stats = Invoke-ACConsultaMasiva -Numeros $listaNumeros -Instancias $pool -OnResultado {
+    param($r)
+    $script:hechos++
+    $reg = New-Registro -Numero $r.Numero
 
-                $reg.ENCONTRADO    = 'SI'
-                $reg.ESTADO        = $c.ESTADO
-                $reg.NOMBRE        = $c.NOMBRE
-                $reg.CUSTCODE      = $c.CUSTCODE
-                $reg.PLAN          = $c.PLAN
-                $reg.TECNOLOGIA    = $c.TECNOLOGIA
-                $reg.TIPO_CLIENTE  = $c.'TIPO DE CLIENTE'
-                $reg.CENTRO_COSTOS = $c.'CENTRO DE COSTOS'
-                $reg.ACTIVA        = if ($c.ESTADO -and $c.ESTADO.Trim().ToUpper() -eq 'ACTIVO') { 'SI' } else { 'NO' }
+    if (-not $r.Encontrado) {
+        $reg.ENCONTRADO  = 'NO'
+        $reg.ACTIVA      = 'NO'
+        $reg.ESTADO      = 'NO ENCONTRADO'
+        $reg.MOTIVO      = $r.Mensaje
+        $reg.OBSERVACION = 'AC no devolvio ninguna linea para este numero.'
+        $txt = "NO ENCONTRADO"; $col = "Yellow"
+    } else {
+        # si el cliente tiene varias lineas, se toma la del numero consultado
+        $fila = $r.Filas | Where-Object { ($_.Campos.MIN -replace '[^0-9]','') -eq $r.Numero } | Select-Object -First 1
+        if (-not $fila) { $fila = $r.Filas[0] }
+        $c = $fila.Campos
 
-                if ($r.Filas.Count -gt 1) {
-                    $reg.OBSERVACION = "El cliente tiene $($r.Filas.Count) lineas; se reporta la del numero consultado."
-                }
-                $col = if ($reg.ACTIVA -eq 'SI') { "OK" } else { "WARN" }
-                Write-Paso "$($c.NOMBRE) - ESTADO: $($c.ESTADO)" $col
-            }
-            $listo = $true
-        } catch {
-            $msg = $_.Exception.Message
-            Write-Paso "Error (intento $intento): $msg" "ERROR"
-            if ($intento -gt $MaxReintentos) {
-                $reg.ENCONTRADO  = 'ERROR'
-                $reg.ACTIVA      = 'REVISAR'
-                $reg.ESTADO      = 'ERROR'
-                $reg.OBSERVACION = $msg
-                $c = Get-ACContext
-                if ($c -and $c.Principal) {
-                    [void](Save-WindowShot -Handle $c.Principal.Handle -Path (Join-Path $dirCapturas "error_$num.png"))
-                }
-            } else {
-                # reiniciar AC deja el aplicativo en un estado limpio
-                Stop-ACSession
-                Start-Sleep -Seconds 2
-                $ctx = Start-ACSession -Password $clave -BaseDatos $BaseDatos
-            }
+        $reg.ENCONTRADO    = 'SI'
+        $reg.ESTADO        = $c.ESTADO
+        $reg.NOMBRE        = $c.NOMBRE
+        $reg.CUSTCODE      = $c.CUSTCODE
+        $reg.PLAN          = $c.PLAN
+        $reg.TECNOLOGIA    = $c.TECNOLOGIA
+        $reg.TIPO_CLIENTE  = $c.'TIPO DE CLIENTE'
+        $reg.CENTRO_COSTOS = $c.'CENTRO DE COSTOS'
+        $reg.ACTIVA        = if ($c.ESTADO -and $c.ESTADO.Trim().ToUpper() -eq 'ACTIVO') { 'SI' } else { 'NO' }
+        if ($r.Filas.Count -gt 1) {
+            $reg.OBSERVACION = "El cliente tiene $($r.Filas.Count) lineas; se reporta la del numero consultado."
         }
+        $txt = "$($c.NOMBRE) - $($c.ESTADO)"
+        $col = if ($reg.ACTIVA -eq 'SI') { "Green" } else { "Yellow" }
     }
 
-    [void]$resultados.Add([pscustomobject]$reg)
-    try { Close-ACResultados -Contexto $ctx } catch { }
+    [void]$script:resultados.Add([pscustomobject]$reg)
+    Write-Host ("  [{0}/{1}] {2}  {3}  ({4}s, inst {5})" -f `
+        $script:hechos, $script:total, $r.Numero, $txt, $r.Segundos, $r.Instancia) -ForegroundColor $col
+}
+
+Stop-ACSession -Todas
+
+Write-Host ""
+Write-Host ("Pasada 1: {0} numeros en {1} s  |  {2} s por numero  |  {3} instancia(s)" -f `
+    $stats.Resultados.Count, $stats.SegundosTotales, $stats.SegundosPorNumero, $stats.InstanciasVivas) -ForegroundColor Cyan
+Write-Host ("Latencia media de cada consulta: {0} s" -f $stats.LatenciaMedia) -ForegroundColor Gray
+if ($Instancias -gt 1 -and $stats.SegundosPorNumero -gt 0) {
+    Write-Host ("Rendimiento: {0} numeros por minuto" -f [Math]::Round(60 / $stats.SegundosPorNumero, 1)) -ForegroundColor Gray
 }
 
 # ---------------------------------------------------------------------
@@ -264,6 +253,7 @@ if ($pendientes.Count -gt 0) {
     Write-Titulo "PASADA 2 - MOTIVO (HISTORIAL, Ctrl+Shift+H)"
     Write-Host "Lineas por revisar: $($pendientes.Count)"
     Write-Host "AC se reinicia despues de cada ficha: es la unica forma de cerrarla sin guardar un Tickler." -ForegroundColor Gray
+    Write-Host "Esta pasada SI usa el raton y una sola instancia: no toques el equipo mientras corre." -ForegroundColor Yellow
     Write-Host ""
 
     $j = 0
@@ -271,7 +261,7 @@ if ($pendientes.Count -gt 0) {
         $j++
         Write-Host ("[{0}/{1}] {2} ({3})" -f $j, $pendientes.Count, $reg.NUMERO, $reg.ESTADO) -ForegroundColor White
         try {
-            Stop-ACSession
+            Stop-ACSession -Todas
             $ctx = Start-ACSession -Password $clave -BaseDatos $BaseDatos
 
             $r = Invoke-ACBusqueda -Numero $reg.NUMERO
@@ -337,4 +327,4 @@ Write-Host ""
 Write-Host "Reporte: $Salida" -ForegroundColor Cyan
 if (Test-Path -LiteralPath $dirCapturas) { Write-Host "Capturas: $dirCapturas" -ForegroundColor Cyan }
 
-try { Stop-ACSession } catch { }
+try { Stop-ACSession -Todas } catch { }

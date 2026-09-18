@@ -80,6 +80,23 @@ function Read-RemoteString {
     return $s.Trim()
 }
 
+function Get-ListViewRowCount {
+    <#  Cuenta las filas con UN solo mensaje y sin reservar memoria remota.
+
+        Es lo que se usa para sondear: llamar a Get-ListViewData en cada ciclo
+        satura el bucle de mensajes de AC (decenas de SendMessage sincronos por
+        segundo mas VirtualAllocEx) y llega a impedir que procese los clics que
+        se le envian.  #>
+    param([Parameter(Mandatory=$true)][IntPtr]$Hwnd)
+    return [int][RP]::SendMessage($Hwnd, $script:LVM_GETITEMCOUNT, [IntPtr]::Zero, [IntPtr]::Zero)
+}
+
+function Get-TreeViewCount {
+    <#  Numero de nodos del arbol con un solo mensaje (TVM_GETCOUNT).  #>
+    param([Parameter(Mandatory=$true)][IntPtr]$Hwnd)
+    return [int][RP]::SendMessage($Hwnd, 0x1105, [IntPtr]::Zero, [IntPtr]::Zero)
+}
+
 function Get-ListViewColumns {
     param([Parameter(Mandatory=$true)][IntPtr]$Hwnd, [int]$Max = 20)
     $hProc = Open-TargetProcess -Hwnd $Hwnd

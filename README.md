@@ -43,6 +43,9 @@ descifrar con tu cuenta en este mismo equipo**, y nunca se guarda en texto plano
 
 # Traer el historial de TODAS las líneas, no solo de las no activas (más lento)
 .\Automatizar-Ventas.ps1 -Archivo ".\entrada\ventas.xlsx" -HistorialSiempre
+
+# Varias instancias de AC en paralelo (más rápido para listas grandes)
+.\Automatizar-Ventas.ps1 -Archivo ".\entrada\ventas.xlsx" -Instancias 4
 ```
 
 | Parámetro | Para qué sirve | Por defecto |
@@ -53,6 +56,7 @@ descifrar con tu cuenta en este mismo equipo**, y nunca se guarda en texto plano
 | `-FilaInicio` | Primera fila con datos (salta el encabezado) | `2` |
 | `-Hoja` | Nombre de la hoja del libro | la primera |
 | `-HistorialSiempre` | Consulta el historial de todas las líneas | solo las no activas |
+| `-Instancias` | Cuántas copias de AC consultan en paralelo (1-12) | `1` |
 | `-BaseDatos` | Base de AC | `AC_PRODUCCION` |
 | `-GuardarClave` | Guarda la clave cifrada y sale | — |
 | `-Salida` | Ruta del CSV de salida | `salida\ventas_<fecha>.csv` |
@@ -110,16 +114,55 @@ Por eso, cuando la automatización necesita cerrar una ficha, **reinicia AC**
 en vez de guardar el tickler. Ese es el motivo de que la pasada 2 tarde
 ~45 segundos por línea, y de que la pasada 1 evite abrir fichas.
 
+### Velocidad y paralelismo
+
+Tiempos medidos sobre este equipo (i5-4590T, 8 GB):
+
+| Instancias | Por número | Proyección 3000 registros |
+|---|---|---|
+| 1 | 5,4 s | ~4,5 h |
+| 2 | 3,5 s | ~2,9 h |
+
+El paralelismo **no escala de forma lineal** (2 instancias dan 1,54×, no 2×).
+El motivo está abajo: los clics tienen que turnarse el primer plano.
+
+Antes de subir de 4 instancias conviene consultarlo con quien administra AC:
+cada instancia es una sesión completa contra el Oracle de producción.
+
+### Por qué ocupa el equipo
+
+La automatización no mueve el ratón: envía los clics como mensajes de Windows
+directamente a cada control. Pero hay un detalle medido que no se puede
+esquivar: **AC solo atiende esos clics si esa instancia es la ventana en primer
+plano en ese instante**, y además el primer clic sobre el panel actúa de
+"cebador" (deja el foco dentro) — el que cuenta es el siguiente.
+
+Por eso las ventanas de AC saltan al frente mientras corre y **no conviene usar
+el equipo al mismo tiempo**. Lo que sí funciona con la ventana de fondo es la
+espera de Oracle y la lectura de las grillas, que es la mayor parte del tiempo:
+de ahí que varias instancias puedan solaparse aunque se turnen el primer plano.
+
 ### Detalles técnicos
 
 - AC es una aplicación VB6 (`ThunderRT6`). Sus grillas
   (`ListView20WndClass`) **no exponen contenido por UI Automation**: se leen
   con mensajes `LVM_*` y memoria reservada dentro del proceso de AC, así que
   los datos salen como texto exacto y **no por OCR**.
+- El sondeo usa `LVM_GETITEMCOUNT` (un solo mensaje). Leer la grilla completa
+  en cada ciclo satura el bucle de mensajes de AC hasta el punto de que deja
+  de procesar los clics que se le envían.
 - El número se escribe con `WM_SETTEXT`, no con pulsaciones: al hacer clic en
   el panel de criterios AC desvía el foco del teclado a un PictureBox.
 - `Ctrl+Shift+H` se envía con `keybd_event`; `SendKeys` no funciona con estos
   formularios.
+- El botón **Consultar** de la ventana de resultados es el único control que
+  no responde a mensajes y exige el ratón real. Por eso la pasada del
+  historial usa una sola instancia y no se puede paralelizar.
+- Poner una ventana en primer plano requiere recuperar el permiso que Windows
+  concede solo a quien generó la última entrada del usuario. Se hace
+  enganchándose a la cola de entrada del hilo con el foco; el truco de pulsar
+  ALT queda como último recurso porque puede activarle la barra de menú a otra
+  instancia de AC y dejarla colgada.
 - Los handles de ventana se descubren en cada ejecución por clase y título,
   nunca están fijos en el código.
 - La contraseña se verifica **dentro del formulario antes de pulsar Aceptar**.
@@ -147,6 +190,7 @@ Ejecutar.bat             Lanzador de doble clic
 lib\Win32.ps1            Interoperabilidad con la API de Windows
 lib\Remote.ps1           Lectura de las grillas de AC (otro proceso)
 lib\AC.ps1               Flujo de AC: login, búsqueda, ficha, historial
+lib\ACParalelo.ps1       Motor de consulta con varias instancias a la vez
 lib\Excel.ps1            Lectura del .xlsx sin Excel instalado
 entrada\                 Aquí va el Excel de ventas
 salida\                  Reportes CSV y capturas de evidencia

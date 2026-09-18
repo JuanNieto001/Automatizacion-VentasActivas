@@ -55,7 +55,15 @@ function Get-ACExePath {
 }
 
 function Get-ACProcess {
+    param([int]$ProcessId = 0)
+    if ($ProcessId -gt 0) {
+        return (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)
+    }
     return (Get-Process | Where-Object { $_.ProcessName -like 'AC Admin*' } | Select-Object -First 1)
+}
+
+function Get-ACProcesses {
+    return @(Get-Process | Where-Object { $_.ProcessName -like 'AC Admin*' })
 }
 
 function Wait-Condition {
@@ -100,8 +108,9 @@ function Close-ACDialogs {
                    Where-Object { $_.Class -eq 'Button' -and $_.Visible } |
                    Select-Object -First 1
             if ($btn) {
-                Set-WindowFocus -Handle $d.Handle
-                Invoke-ClickControl -Handle $btn.Handle
+                # por mensaje: no roba el raton ni exige primer plano, asi que
+                # funciona con varias instancias corriendo a la vez
+                Invoke-PostClick -Handle $btn.Handle
             } else {
                 [void][W32]::PostMessage($d.Handle, [W32]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
             }
@@ -128,7 +137,12 @@ function Close-ACTickler {
 # ---------------------------------------------------------------------
 
 function Get-ACContext {
-    $p = Get-ACProcess
+    <#  Descubre ventanas y controles de UNA instancia de AC.
+        Con -ProcessId apunta a una instancia concreta, lo que permite
+        manejar varias a la vez.  #>
+    param([int]$ProcessId = 0)
+
+    $p = Get-ACProcess -ProcessId $ProcessId
     if (-not $p) { return $null }
 
     $tops = Get-TopWindows -ProcessId $p.Id | Where-Object Visible
@@ -172,33 +186,75 @@ function Get-ACContext {
 # ---------------------------------------------------------------------
 
 function Stop-ACSession {
-    $p = Get-ACProcess
-    if ($p) {
-        try { $p.Kill(); Start-Sleep -Seconds 3 } catch { }
+    <#  Cierra una instancia concreta o todas.  #>
+    param([int]$ProcessId = 0, [switch]$Todas)
+
+    if ($Todas) {
+        foreach ($p in (Get-ACProcesses)) { try { $p.Kill() } catch { } }
+        Start-Sleep -Seconds 2
+        $null = Wait-Condition -TimeoutSeg 15 -Condicion { if ((Get-ACProcesses).Count -eq 0) { $true } }
+        return
     }
-    # esperar a que el proceso desaparezca
-    $null = Wait-Condition -Condicion { if (-not (Get-ACProcess)) { $true } } -TimeoutSeg 15
+
+    $p = Get-ACProcess -ProcessId $ProcessId
+    if ($p) { try { $p.Kill(); Start-Sleep -Seconds 3 } catch { } }
+    $null = Wait-Condition -TimeoutSeg 15 -Condicion {
+        if (-not (Get-ACProcess -ProcessId $ProcessId)) { $true }
+    }
+}
+
+function Start-ACInstancia {
+    <#  Lanza UNA instancia nueva de AC sin tocar las que ya esten corriendo,
+        e inicia sesion usando solo mensajes (sin raton ni teclado globales).
+        Devuelve el contexto de esa instancia.  #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Password,
+        [string]$BaseDatos = "AC_PRODUCCION",
+        [int]$TimeoutSeg = 120,
+        [switch]$Silencioso
+    )
+    $exe = Get-ACExePath
+    $p = Start-Process -FilePath $exe -WorkingDirectory (Split-Path -Parent $exe) -PassThru
+    return (Connect-ACInstancia -ProcessId $p.Id -Password $Password -BaseDatos $BaseDatos `
+                                -TimeoutSeg $TimeoutSeg -Silencioso:$Silencioso)
 }
 
 function Start-ACSession {
-    <#  Abre AC e inicia sesion. Devuelve el contexto con la sesion lista.  #>
+    <#  Deja UNA sola instancia de AC con sesion iniciada (cierra las previas).
+        Es lo que usa la pasada del historial, que no se puede paralelizar.  #>
     param(
         [Parameter(Mandatory=$true)][string]$Password,
         [string]$BaseDatos = "AC_PRODUCCION",
         [int]$TimeoutSeg = 90
     )
 
-    if (Get-ACProcess) {
-        Write-Paso "Cerrando una instancia previa de AC..."
-        Stop-ACSession
+    if ((Get-ACProcesses).Count -gt 0) {
+        Write-Paso "Cerrando instancias previas de AC..."
+        Stop-ACSession -Todas
     }
-
     $exe = Get-ACExePath
     Write-Paso "Abriendo AC: $exe"
-    Start-Process -FilePath $exe -WorkingDirectory (Split-Path -Parent $exe)
+    $p = Start-Process -FilePath $exe -WorkingDirectory (Split-Path -Parent $exe) -PassThru
+    return (Connect-ACInstancia -ProcessId $p.Id -Password $Password -BaseDatos $BaseDatos -TimeoutSeg $TimeoutSeg)
+}
 
-    $ctx = Wait-Condition -Condicion { $c = Get-ACContext; if ($c -and $c.Login) { $c } } -TimeoutSeg $TimeoutSeg
-    if (-not $ctx) { throw "No aparecio la ventana de conexion de AC." }
+function Connect-ACInstancia {
+    <#  Inicia sesion en una instancia de AC ya lanzada.  #>
+    param(
+        [Parameter(Mandatory=$true)][int]$ProcessId,
+        [Parameter(Mandatory=$true)][string]$Password,
+        [string]$BaseDatos = "AC_PRODUCCION",
+        [int]$TimeoutSeg = 120,
+        [switch]$Silencioso
+    )
+
+    function Log { param($m, $n = "INFO") if (-not $Silencioso) { Write-Paso $m $n } }
+
+    $ctx = Wait-Condition -TimeoutSeg $TimeoutSeg -Condicion {
+        $c = Get-ACContext -ProcessId $ProcessId
+        if ($c -and $c.Login) { $c }
+    }
+    if (-not $ctx) { throw "No aparecio la ventana de conexion de AC (PID $ProcessId)." }
 
     Set-WindowFocus -Handle $ctx.Login.Handle
     $ctrls = Get-ChildHandles -Parent $ctx.Login.Handle
@@ -214,7 +270,7 @@ function Start-ACSession {
     Start-Sleep -Milliseconds 300
     $sel = [int64][W32]::SendMessage($combo.Handle, [W32]::CB_GETCURSEL, [IntPtr]::Zero, [IntPtr]::Zero)
     if ($sel -ne $idx) { throw "No se pudo seleccionar la base de datos '$BaseDatos'." }
-    Write-Paso "Base de datos: $BaseDatos"
+    Log "Base de datos: $BaseDatos"
 
     # Contrasena: unico TextBox habilitado (Dominio y Usuario vienen bloqueados)
     $txtPass = $ctrls | Where-Object { $_.Class -like '*TextBox*' -and $_.Enabled -and $_.Visible } | Select-Object -First 1
@@ -226,7 +282,8 @@ function Start-ACSession {
     if ($escrito -ne $Password) {
         # Respaldo: escribir tecla por tecla. El campo se verifica siempre antes
         # de pulsar Aceptar para no gastar intentos contra el bloqueo de cuenta.
-        Write-Paso "WM_SETTEXT no cargo el campo; escribiendo por teclado..." "WARN"
+        Log "WM_SETTEXT no cargo el campo; escribiendo por teclado..." "WARN"
+        Set-WindowFocus -Handle $ctx.Login.Handle
         Invoke-ClickControl -Handle $txtPass.Handle -SettleMs 300
         [System.Windows.Forms.SendKeys]::SendWait("{END}")
         for ($k = 0; $k -lt 40; $k++) { [System.Windows.Forms.SendKeys]::SendWait("{BACKSPACE}"); Start-Sleep -Milliseconds 15 }
@@ -245,37 +302,40 @@ function Start-ACSession {
                "(el campo tiene $("$escrito".Length) caracteres y la clave tiene $($Password.Length)). " +
                "No se pulso Aceptar para no gastar intentos de inicio de sesion.")
     }
-    Write-Paso "Credenciales cargadas y verificadas en el formulario"
+    Log "Credenciales cargadas y verificadas en el formulario"
 
     # Aceptar: de los dos UserControl del pie, el de menor X
     $botones = $ctrls | Where-Object { $_.Class -eq 'ThunderRT6UserControlDC' -and $_.Visible } | Sort-Object X
     if ($botones.Count -lt 1) { throw "No se encontro el boton Aceptar." }
+
+    # Aceptar solo responde al raton real (probado: por mensaje no reacciona, y
+    # ademas deja el control en un estado que ignora el clic fisico posterior).
+    # No es problema para el paralelismo: el login ocurre una sola vez por
+    # instancia y se hace de a una; las consultas si van por mensajes.
     Invoke-ClickControl -Handle $botones[0].Handle
 
-    # Resultado: ventana principal MDI, o dialogo de error
     $res = Wait-Condition -TimeoutSeg $TimeoutSeg -Condicion {
-        $c = Get-ACContext
+        $c = Get-ACContext -ProcessId $ProcessId
         if (-not $c) { return $null }
         if ($c.Principal) { return @{ Ok = $true; Ctx = $c } }
         if ($c.Dialogos -and $c.Dialogos.Count -gt 0) { return @{ Ok = $false; Ctx = $c } }
-        return $null
     }
     if (-not $res) { throw "AC no respondio al iniciar sesion (tiempo de espera agotado)." }
 
     if (-not $res.Ok) {
         $msg = ($res.Ctx.Dialogos | ForEach-Object { Read-DialogText -Handle $_.Handle }) -join ' | '
-        [void](Close-ACDialogs -ProcessId $res.Ctx.ProcessId)
+        [void](Close-ACDialogs -ProcessId $ProcessId)
         throw "AC rechazo el inicio de sesion: $msg"
     }
 
     # dar tiempo a que cargue el perfil y el panel de criterios
-    $ctx = Wait-Condition -TimeoutSeg 60 -Condicion {
-        $c = Get-ACContext
+    $ctx = Wait-Condition -TimeoutSeg 90 -Condicion {
+        $c = Get-ACContext -ProcessId $ProcessId
         if ($c -and $c.PanelCriterios -and $c.BotonBuscar) { $c }
     }
     if (-not $ctx) { throw "AC inicio sesion pero no cargo el panel de criterios de busqueda." }
 
-    Write-Paso "Sesion iniciada en AC" "OK"
+    Log "Sesion iniciada en AC (PID $ProcessId)" "OK"
     return $ctx
 }
 
@@ -284,32 +344,35 @@ function Start-ACSession {
 # ---------------------------------------------------------------------
 
 function Close-ACResultados {
-    param([Parameter(Mandatory=$true)]$Contexto)
-    $c = Get-ACContext
+    param($Contexto, [int]$ProcessId = 0)
+    if ($ProcessId -eq 0 -and $Contexto) { $ProcessId = $Contexto.ProcessId }
+    $c = Get-ACContext -ProcessId $ProcessId
     if ($c -and $c.Resultados) {
         [void][W32]::PostMessage($c.Resultados.Handle, [W32]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
-        Start-Sleep -Milliseconds 800
+        Start-Sleep -Milliseconds 600
     }
 }
 
 function Invoke-ACBusqueda {
     <#  Escribe el numero, pulsa BUSCAR y devuelve las filas de la grilla.
+        Todo por mensajes: no usa raton ni teclado, funciona con AC en segundo
+        plano y no interfiere con otras instancias.
         No abre la ficha del cliente: no genera ningun Tickler.  #>
     param(
         [Parameter(Mandatory=$true)][string]$Numero,
+        [int]$ProcessId = 0,
         [int]$TimeoutSeg = 45
     )
 
-    $ctx = Get-ACContext
+    $ctx = Get-ACContext -ProcessId $ProcessId
     if (-not $ctx -or -not $ctx.Principal) { throw "La sesion de AC no esta disponible." }
+    if ($ProcessId -eq 0) { $ProcessId = $ctx.ProcessId }
     if ($ctx.Ficha) { throw "Hay una ficha de cliente abierta; AC no permite buscar hasta cerrarla." }
 
-    if ($ctx.Resultados) { Close-ACResultados -Contexto $ctx; $ctx = Get-ACContext }
-
-    Set-WindowFocus -Handle $ctx.Principal.Handle
+    if ($ctx.Resultados) { Close-ACResultados -ProcessId $ProcessId; $ctx = Get-ACContext -ProcessId $ProcessId }
 
     # Criterio MIN / MSISDN
-    if ($ctx.RadioMin) { Invoke-ClickControl -Handle $ctx.RadioMin.Handle -SettleMs 200 }
+    if ($ctx.RadioMin) { Invoke-PostClick -Handle $ctx.RadioMin.Handle -SettleMs 150 }
 
     # El numero se escribe con WM_SETTEXT: no depende del foco del teclado,
     # que en AC se desvia a un PictureBox al hacer clic en el panel.
@@ -317,11 +380,11 @@ function Invoke-ACBusqueda {
     $leido = Set-CtrlText -Handle $ctx.EditCriterio.Handle -Text $Numero
     if ($leido -ne $Numero) { throw "No se pudo escribir el numero en el campo Criterio (quedo '$leido')." }
 
-    Invoke-ClickControl -Handle $ctx.BotonBuscar.Handle -SettleMs 500
+    Invoke-PostClick -Handle $ctx.BotonBuscar.Handle -SettleMs 150
 
     # Esperar la ventana de resultados o un dialogo
-    $r = Wait-Condition -TimeoutSeg $TimeoutSeg -Condicion {
-        $c = Get-ACContext
+    $r = Wait-Condition -TimeoutSeg $TimeoutSeg -IntervaloMs 150 -Condicion {
+        $c = Get-ACContext -ProcessId $ProcessId
         if ($c.Resultados) { return @{ Tipo = 'Resultados'; Ctx = $c } }
         if ($c.Dialogos -and $c.Dialogos.Count -gt 0) { return @{ Tipo = 'Dialogo'; Ctx = $c } }
         return $null
@@ -341,7 +404,7 @@ function Invoke-ACBusqueda {
 
     # La ventana aparece antes de que sus controles esten poblados: hay que
     # esperar a que el arbol tenga nodos, no basta con que exista la ventana.
-    $ctrls = Wait-Condition -TimeoutSeg 20 -Condicion {
+    $ctrls = Wait-Condition -TimeoutSeg 20 -IntervaloMs 150 -Condicion {
         $k = Get-ChildHandles -Parent $ctx.Resultados.Handle
         if (($k | Where-Object { $_.Class -like 'ListView*' }) -and
             ($k | Where-Object { $_.Class -like 'TreeView*' })) { $k }
@@ -351,22 +414,22 @@ function Invoke-ACBusqueda {
     $tv = $ctrls | Where-Object { $_.Class -like 'TreeView*' } | Select-Object -First 1
     $lv = $ctrls | Where-Object { $_.Class -like 'ListView*' } | Select-Object -First 1
 
-    $nodos = @(Wait-Condition -TimeoutSeg 20 -Condicion {
+    $nodos = @(Wait-Condition -TimeoutSeg 20 -IntervaloMs 150 -Condicion {
         $n = @(Get-TreeViewItems -Hwnd $tv.Handle)
         if ($n.Count -gt 0) { ,$n }
     })
 
     # Paso 4: seleccionar la linea en el arbol para que se llene la grilla.
-    # El clic puede perderse si el arbol aun esta pintandose; se reintenta.
+    # TVM_SELECTITEM no dispara el evento de AC; si lo hace un clic enviado
+    # como mensaje al propio TreeView. Se reintenta por si el arbol aun pinta.
     $datos = $null
     if ($nodos.Count -gt 0) {
-        for ($intento = 1; $intento -le 3 -and -not $datos; $intento++) {
-            Set-WindowFocus -Handle $ctx.Principal.Handle
+        for ($intento = 1; $intento -le 4 -and -not $datos; $intento++) {
             $tvAhora = Get-ChildHandles -Parent $ctx.Resultados.Handle |
                        Where-Object { $_.Class -like 'TreeView*' } | Select-Object -First 1
             if (-not $tvAhora) { break }
-            Invoke-ClickAt -X ($tvAhora.X + 60) -Y ($tvAhora.Y + 10) -SettleMs 500
-            $datos = Wait-Condition -TimeoutSeg 8 -Condicion {
+            Invoke-PostClick -Handle $tvAhora.Handle -X 60 -Y 10 -SettleMs 150
+            $datos = Wait-Condition -TimeoutSeg 6 -IntervaloMs 150 -Condicion {
                 $d = Get-ListViewData -Hwnd $lv.Handle
                 if ($d.Rows.Count -gt 0) { $d }
             }
@@ -374,7 +437,7 @@ function Invoke-ACBusqueda {
     }
 
     if (-not $datos) {
-        $msgs = Close-ACDialogs -ProcessId $ctx.ProcessId
+        $msgs = Close-ACDialogs -ProcessId $ProcessId
         return [pscustomobject]@{
             Encontrado = $false
             Mensaje    = if ($msgs) { $msgs -join ' | ' } else { "La busqueda no devolvio ninguna linea." }
@@ -407,6 +470,9 @@ function Open-ACFicha {
     $botones = @($ctrls | Where-Object { $_.Class -eq 'ThunderRT6UserControlDC' -and $_.Visible -and $_.W -gt 60 } | Sort-Object X)
     if ($botones.Count -lt 1) { throw "No se encontro el boton Consultar." }
 
+    # Este es el UNICO paso que no funciona por mensaje: probado, Consultar no
+    # reacciona a WM_LBUTTONDOWN/UP y exige el raton real. Por eso la pasada
+    # del historial no se puede paralelizar.
     Set-WindowFocus -Handle $ctx.Principal.Handle
     Invoke-ClickControl -Handle $botones[0].Handle -SettleMs 800
 

@@ -1,0 +1,301 @@
+# =====================================================================
+#  ACParalelo.ps1 - Consulta de estado con varias instancias de AC a la vez
+#
+#  Solo aplica a la pasada de ESTADO (activo / no activo), que se maneja
+#  integramente por mensajes de Windows: no usa raton ni teclado, funciona
+#  con AC en segundo plano y por eso varias instancias no se estorban.
+#
+#  La pasada del HISTORIAL no se puede paralelizar: abrir la ficha del
+#  cliente exige un clic con el raton real, y el raton es unico por sesion
+#  de Windows.
+# =====================================================================
+
+. "$PSScriptRoot\Win32.ps1"
+. "$PSScriptRoot\Remote.ps1"
+. "$PSScriptRoot\AC.ps1"
+
+function Get-ACControlesFijos {
+    <#  Captura una sola vez los controles que no cambian durante la sesion.
+        Redescubrirlos en cada sondeo costaria mas que la consulta misma.  #>
+    param([Parameter(Mandatory=$true)][int]$ProcessId)
+
+    $c = Get-ACContext -ProcessId $ProcessId
+    if (-not $c -or -not $c.BotonBuscar) { return $null }
+    return [pscustomobject]@{
+        ProcessId  = $ProcessId
+        Principal  = $c.Principal
+        MDIClient  = $c.MDIClient
+        Edit       = $c.EditCriterio
+        Radio      = $c.RadioMin
+        Buscar     = $c.BotonBuscar
+    }
+}
+
+function Invoke-ACClicActivado {
+    <#  Envia un clic por mensaje a un control de AC, activando antes su ventana.
+
+        Hallazgo medido: AC solo atiende el clic enviado por mensaje si esa
+        instancia es la ventana en primer plano en ese instante. Ademas, el
+        primer clic sobre el panel actua de "cebador" (deja el foco dentro del
+        panel) y el que cuenta es el siguiente.
+
+        Esto NO impide paralelizar: el primer plano solo hace falta durante el
+        clic (unas decimas), mientras que la espera de Oracle y la lectura de
+        las grillas funcionan con la ventana de fondo. Las instancias se turnan
+        el primer plano y sus esperas se solapan.  #>
+    param(
+        [Parameter(Mandatory=$true)]$Fijos,
+        [Parameter(Mandatory=$true)][IntPtr]$Control,
+        [IntPtr]$Cebo = [IntPtr]::Zero,
+        [int]$X = 10, [int]$Y = 10
+    )
+    if (-not (Set-WindowFocus -Handle $Fijos.Principal.Handle)) { return $false }
+    if ($Cebo -ne [IntPtr]::Zero) {
+        Invoke-PostClick -Handle $Cebo
+        Start-Sleep -Milliseconds 120
+    }
+    Invoke-PostClick -Handle $Control -X $X -Y $Y
+    return $true
+}
+
+function Get-VentanaResultados {
+    <#  Sondeo barato: solo mira los hijos del cliente MDI.  #>
+    param([Parameter(Mandatory=$true)]$Fijos)
+    if (-not $Fijos.MDIClient) { return $null }
+    return (Get-ChildHandles -Parent $Fijos.MDIClient.Handle |
+            Where-Object { $_.Visible -and $_.Class -eq 'ThunderRT6FormDC' -and $_.Text -like 'Resultados*' } |
+            Select-Object -First 1)
+}
+
+function Start-ACInstancias {
+    <#  Levanta N instancias de AC con sesion iniciada.  #>
+    param(
+        [Parameter(Mandatory=$true)][int]$Cantidad,
+        [Parameter(Mandatory=$true)][string]$Password,
+        [string]$BaseDatos = 'AC_PRODUCCION'
+    )
+
+    Stop-ACSession -Todas
+    $inst = New-Object System.Collections.ArrayList
+
+    for ($i = 1; $i -le $Cantidad; $i++) {
+        try {
+            $ctx = Start-ACInstancia -Password $Password -BaseDatos $BaseDatos -Silencioso
+            $fijos = Get-ACControlesFijos -ProcessId $ctx.ProcessId
+            if (-not $fijos) { throw "la instancia no expuso el panel de criterios" }
+            [void]$inst.Add([ordered]@{
+                Indice   = $i
+                Fijos    = $fijos
+                Estado   = 'libre'
+                Numero   = $null
+                T0       = $null
+                Intentos = 0
+                UltClic  = [datetime]::MinValue
+            })
+            Write-Paso "Instancia $i de $Cantidad lista (PID $($ctx.ProcessId))" "OK"
+        } catch {
+            Write-Paso "No se pudo levantar la instancia ${i}: $($_.Exception.Message)" "ERROR"
+        }
+    }
+
+    if ($inst.Count -eq 0) { throw "No se pudo iniciar ninguna instancia de AC." }
+    return $inst
+}
+
+function Invoke-ACConsultaMasiva {
+    <#  Consulta el estado de una lista de numeros repartiendolos entre las
+        instancias disponibles. Devuelve un resultado por numero, en el orden
+        en que fueron terminando, mas estadisticas de tiempo.
+
+        -OnResultado recibe cada resultado apenas esta listo, para que quien
+        llame pueda ir mostrando el avance.  #>
+    param(
+        [Parameter(Mandatory=$true)][string[]]$Numeros,
+        [Parameter(Mandatory=$true)]$Instancias,
+        [scriptblock]$OnResultado,
+        [int]$TimeoutPorNumeroSeg = 75,
+        [int]$IntervaloMs = 250,
+        [switch]$Trace
+    )
+
+    $cola = New-Object System.Collections.Queue
+    foreach ($n in $Numeros) { $cola.Enqueue($n) }
+
+    $resultados = New-Object System.Collections.ArrayList
+    $tiempos    = New-Object System.Collections.ArrayList
+    $swGlobal   = [Diagnostics.Stopwatch]::StartNew()
+
+    function Publicar {
+        param($Inst, $Res)
+        $seg = if ($Inst.T0) { ((Get-Date) - $Inst.T0).TotalSeconds } else { 0 }
+        [void]$tiempos.Add($seg)
+        $Res | Add-Member -NotePropertyName Segundos  -NotePropertyValue ([Math]::Round($seg, 2)) -Force
+        $Res | Add-Member -NotePropertyName Instancia -NotePropertyValue $Inst.Indice -Force
+        [void]$resultados.Add($Res)
+        if ($OnResultado) { & $OnResultado $Res }
+        # dejar la instancia lista para el siguiente numero
+        Close-ACResultados -ProcessId $Inst.Fijos.ProcessId
+        $Inst.Estado   = 'libre'
+        $Inst.Numero   = $null
+        $Inst.Intentos = 0
+    }
+
+    while ($cola.Count -gt 0 -or ($Instancias | Where-Object { $_.Estado -ne 'libre' })) {
+
+        foreach ($inst in $Instancias) {
+
+            if ($inst.Estado -eq 'muerta') { continue }
+
+            # --- la instancia murio: se descarta para no colgar el ciclo ---
+            if (-not (Get-ACProcess -ProcessId $inst.Fijos.ProcessId)) {
+                if ($inst.Numero) {
+                    Publicar -Inst $inst -Res ([pscustomobject]@{
+                        Numero = $inst.Numero; Encontrado = $false
+                        Mensaje = "La instancia de AC se cerro inesperadamente."; Filas = @()
+                    })
+                }
+                $inst.Estado = 'muerta'
+                Write-Paso "La instancia $($inst.Indice) se cerro; se continua con las demas." "WARN"
+                continue
+            }
+
+            # ---------------- libre: tomar el siguiente numero ----------------
+            if ($inst.Estado -eq 'libre') {
+                if ($cola.Count -gt 0) {
+                    $num = $cola.Dequeue()
+                    $inst.Numero   = $num
+                    $inst.T0       = Get-Date
+                    $inst.Intentos = 0
+                    $inst.UltClic  = [datetime]::MinValue
+                    try {
+                        # Saca la instancia de un eventual modo menu (una pulsacion
+                        # de ALT de otro proceso puede activarle la barra de menu,
+                        # y ahi deja de atender los clics enviados por mensaje).
+                        [void][W32]::PostMessage($inst.Fijos.Principal.Handle, 0x001F, [IntPtr]::Zero, [IntPtr]::Zero)
+
+                        # activar + cebar con el radio MIN/MSISDN + escribir + BUSCAR
+                        if (-not (Set-WindowFocus -Handle $inst.Fijos.Principal.Handle)) {
+                            throw "no se pudo poner la ventana de AC en primer plano"
+                        }
+                        if ($inst.Fijos.Radio) {
+                            Invoke-PostClick -Handle $inst.Fijos.Radio.Handle
+                            Start-Sleep -Milliseconds 120
+                        }
+                        $leido = Set-CtrlText -Handle $inst.Fijos.Edit.Handle -Text $num
+                        if ($leido -ne $num) { throw "el campo Criterio quedo en '$leido'" }
+                        Invoke-PostClick -Handle $inst.Fijos.Buscar.Handle
+                        $inst.Estado = 'esperando'
+                    } catch {
+                        Publicar -Inst $inst -Res ([pscustomobject]@{
+                            Numero = $num; Encontrado = $false
+                            Mensaje = "No se pudo lanzar la busqueda: $($_.Exception.Message)"; Filas = @()
+                        })
+                    }
+                }
+            }
+
+            # ------------- esperando: que aparezca la ventana -----------------
+            elseif ($inst.Estado -eq 'esperando') {
+                $transcurrido = ((Get-Date) - $inst.T0).TotalSeconds
+                if (Get-VentanaResultados -Fijos $inst.Fijos) {
+                    $inst.Estado = 'leyendo'
+                }
+                else {
+                    $resuelto = $false
+                    # Los dialogos se revisan recien despues de unos segundos:
+                    # enumerar ventanas en cada sondeo costaria mas que esperar.
+                    if ($transcurrido -gt 3) {
+                        if ((Get-ACDialogs -ProcessId $inst.Fijos.ProcessId).Count -gt 0) {
+                            $msgs = Close-ACDialogs -ProcessId $inst.Fijos.ProcessId
+                            Publicar -Inst $inst -Res ([pscustomobject]@{
+                                Numero = $inst.Numero; Encontrado = $false
+                                Mensaje = ($msgs -join ' | '); Filas = @()
+                            })
+                            $resuelto = $true
+                        }
+                    }
+                    if (-not $resuelto -and $transcurrido -gt $TimeoutPorNumeroSeg) {
+                        Publicar -Inst $inst -Res ([pscustomobject]@{
+                            Numero = $inst.Numero; Encontrado = $false
+                            Mensaje = "AC no respondio en $TimeoutPorNumeroSeg s."; Filas = @()
+                        })
+                    }
+                }
+            }
+
+            # ---------- leyendo: seleccionar la linea y leer la grilla --------
+            elseif ($inst.Estado -eq 'leyendo') {
+                $transcurrido = ((Get-Date) - $inst.T0).TotalSeconds
+                $vent = Get-VentanaResultados -Fijos $inst.Fijos
+
+                if (-not $vent) {
+                    if ($transcurrido -gt $TimeoutPorNumeroSeg) {
+                        Publicar -Inst $inst -Res ([pscustomobject]@{
+                            Numero = $inst.Numero; Encontrado = $false
+                            Mensaje = "La ventana de resultados desaparecio."; Filas = @()
+                        })
+                    }
+                }
+                else {
+                    $k  = Get-ChildHandles -Parent $vent.Handle
+                    $tv = $k | Where-Object { $_.Class -like 'TreeView*' } | Select-Object -First 1
+                    $lv = $k | Where-Object { $_.Class -like 'ListView*' } | Select-Object -First 1
+
+                    if ($tv -and $lv) {
+                        # sondeo barato: un solo mensaje, sin memoria remota
+                        $filas = Get-ListViewRowCount -Hwnd $lv.Handle
+                        if ($Trace) {
+                            Write-Host ("    [traza inst {0}] t={1:N1}s filas={2} clics={3}" -f `
+                                $inst.Indice, $transcurrido, $filas, $inst.Intentos) -ForegroundColor DarkGray
+                        }
+
+                        if ($filas -gt 0) {
+                            $d = Get-ListViewData -Hwnd $lv.Handle
+                            Publicar -Inst $inst -Res ([pscustomobject]@{
+                                Numero = $inst.Numero; Encontrado = $true; Mensaje = ''
+                                Columnas = $d.Columns; Filas = $d.Rows
+                            })
+                        }
+                        else {
+                            # Seleccionar la linea en el arbol, pero solo cuando
+                            # el nodo ya existe: si se hace antes, AC ignora el
+                            # clic y se pierde mas de un segundo por consulta.
+                            if (((Get-Date) - $inst.UltClic).TotalMilliseconds -gt 800) {
+                                if ((Get-TreeViewCount -Hwnd $tv.Handle) -gt 0) {
+                                    [void](Invoke-ACClicActivado -Fijos $inst.Fijos -Control $tv.Handle -X 60 -Y 10)
+                                    $inst.UltClic = Get-Date
+                                    $inst.Intentos++
+                                }
+                            }
+                            if ($transcurrido -gt $TimeoutPorNumeroSeg) {
+                                $msgs = Close-ACDialogs -ProcessId $inst.Fijos.ProcessId
+                                Publicar -Inst $inst -Res ([pscustomobject]@{
+                                    Numero = $inst.Numero; Encontrado = $false
+                                    Mensaje = if ($msgs) { $msgs -join ' | ' } else { "La busqueda no devolvio ninguna linea." }
+                                    Filas = @()
+                                })
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if ($Instancias | Where-Object { $_.Estado -eq 'esperando' -or $_.Estado -eq 'leyendo' }) {
+            Start-Sleep -Milliseconds $IntervaloMs
+        }
+        if (($Instancias | Where-Object { $_.Estado -ne 'muerta' }).Count -eq 0) {
+            throw "Todas las instancias de AC se cerraron."
+        }
+    }
+
+    $swGlobal.Stop()
+    $vivas = @($Instancias | Where-Object { $_.Estado -ne 'muerta' }).Count
+    return [pscustomobject]@{
+        Resultados        = $resultados
+        SegundosTotales   = [Math]::Round($swGlobal.Elapsed.TotalSeconds, 1)
+        SegundosPorNumero = if ($resultados.Count) { [Math]::Round($swGlobal.Elapsed.TotalSeconds / $resultados.Count, 2) } else { 0 }
+        LatenciaMedia     = if ($tiempos.Count) { [Math]::Round(($tiempos | Measure-Object -Average).Average, 2) } else { 0 }
+        InstanciasVivas   = $vivas
+    }
+}

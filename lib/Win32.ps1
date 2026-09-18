@@ -45,6 +45,16 @@ public class W32 {
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    [DllImport("user32.dll")]
+    public static extern IntPtr WindowFromPoint(POINT p);
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
+    [DllImport("user32.dll")]
+    public static extern bool BringWindowToTop(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
     [DllImport("user32.dll")]
     public static extern bool EnumChildWindows(IntPtr hWnd, EnumWindowsProc cb, IntPtr lParam);
@@ -205,13 +215,57 @@ function Invoke-ClickAt {
 }
 
 function Invoke-ClickControl {
-    <#  Clic sobre un control. Los UserControl de VB6 no responden a BM_CLICK,
-        por eso se usa el raton fisico sobre el centro del control.  #>
+    <#  Clic con el raton fisico sobre el centro del control.
+
+        Antes de pulsar comprueba que ese punto de pantalla corresponde de
+        verdad a la ventana destino: si el primer plano no se pudo cambiar, el
+        clic caeria sobre otra aplicacion. Prefiere Invoke-PostClick donde
+        funcione; esto bloquea el raton del equipo.  #>
     param([Parameter(Mandatory=$true)][IntPtr]$Handle, [int]$SettleMs = 250)
     if (-not [W32]::IsWindow($Handle)) { throw "El control $Handle ya no existe" }
+
     $r = New-Object W32+RECT
     [void][W32]::GetWindowRect($Handle, [ref]$r)
-    Invoke-ClickAt -X ([int](($r.Left + $r.Right) / 2)) -Y ([int](($r.Top + $r.Bottom) / 2)) -SettleMs $SettleMs
+    $x = [int](($r.Left + $r.Right) / 2)
+    $y = [int](($r.Top + $r.Bottom) / 2)
+
+    $procDestino = 0
+    [void][W32]::GetWindowThreadProcessId($Handle, [ref]$procDestino)
+    $raiz = [W32]::GetAncestor($Handle, 2)   # GA_ROOT
+
+    for ($i = 1; $i -le 3; $i++) {
+        if (Test-PuntoEnProceso -X $x -Y $y -ProcessId $procDestino) {
+            Invoke-ClickAt -X $x -Y $y -SettleMs $SettleMs
+            return
+        }
+        if ($raiz -ne [IntPtr]::Zero) { [void](Set-WindowFocus -Handle $raiz) }
+        Start-Sleep -Milliseconds 250
+    }
+    throw ("No se pudo hacer clic en el control: el punto ($x,$y) pertenece a otra ventana. " +
+           "Probablemente otra aplicacion quedo encima de AC.")
+}
+
+function Invoke-PostClick {
+    <#  Clic enviado como mensaje a la cola del control, sin mover el raton.
+
+        Es la diferencia entre poder paralelizar o no: el raton y el teclado
+        son recursos unicos de la sesion de Windows, pero los mensajes van a
+        una ventana concreta. Funciona aunque AC este en segundo plano y deja
+        el equipo libre para trabajar mientras corre.
+
+        Los UserControl de VB6 de AC responden a WM_LBUTTONDOWN/UP, salvo el
+        boton Consultar de la ventana de resultados (ver Open-ACFicha).  #>
+    param(
+        [Parameter(Mandatory=$true)][IntPtr]$Handle,
+        [int]$X = 10, [int]$Y = 10,
+        [int]$SettleMs = 0
+    )
+    if (-not [W32]::IsWindow($Handle)) { throw "El control $Handle ya no existe" }
+    $lp = [IntPtr](($Y -shl 16) -bor $X)
+    [void][W32]::PostMessage($Handle, [W32]::WM_LBUTTONDOWN, [IntPtr]1, $lp)
+    Start-Sleep -Milliseconds 40
+    [void][W32]::PostMessage($Handle, [W32]::WM_LBUTTONUP, [IntPtr]0, $lp)
+    if ($SettleMs -gt 0) { Start-Sleep -Milliseconds $SettleMs }
 }
 
 function Send-Hotkey {
@@ -228,10 +282,72 @@ function Send-Hotkey {
 }
 
 function Set-WindowFocus {
-    param([Parameter(Mandatory=$true)][IntPtr]$Handle)
-    [void][W32]::ShowWindow($Handle, 9)      # SW_RESTORE
-    [void][W32]::SetForegroundWindow($Handle)
-    Start-Sleep -Milliseconds 400
+    <#  Trae una ventana al frente de verdad.
+
+        SetForegroundWindow a secas FALLA silenciosamente cuando el proceso que
+        llama no tiene derecho de primer plano (Windows lo restringe a quien
+        genero la ultima entrada del usuario). Si eso pasa, un clic fisico
+        posterior aterriza en la ventana equivocada.
+
+        Se combinan las dos tecnicas habituales para recuperar ese permiso:
+        pulsar ALT, y engancharse a la cola de entrada del hilo que tiene el
+        foco. Devuelve si lo consiguio.  #>
+    param([Parameter(Mandatory=$true)][IntPtr]$Handle, [int]$Reintentos = 6)
+
+    for ($i = 1; $i -le $Reintentos; $i++) {
+        [void][W32]::ShowWindow($Handle, 9)      # SW_RESTORE
+        [void][W32]::BringWindowToTop($Handle)
+        [void][W32]::SetForegroundWindow($Handle)
+        Start-Sleep -Milliseconds 180
+        if ([W32]::GetForegroundWindow() -eq $Handle) { return $true }
+
+        # Engancharse a la cola de entrada del hilo que tiene el foco.
+        # Se intenta ANTES que el truco de ALT porque no genera pulsaciones.
+        $pidTmp = 0
+        $hiloDestino = [W32]::GetWindowThreadProcessId($Handle, [ref]$pidTmp)
+        $anterior    = [W32]::GetForegroundWindow()
+        $hiloActual  = [W32]::GetWindowThreadProcessId($anterior, [ref]$pidTmp)
+        $propio      = [W32]::GetCurrentThreadId()
+        if ($hiloActual -ne 0 -and $hiloActual -ne $propio) {
+            [void][W32]::AttachThreadInput($propio, $hiloActual, $true)
+            [void][W32]::AttachThreadInput($hiloDestino, $hiloActual, $true)
+            [void][W32]::SetForegroundWindow($Handle)
+            [void][W32]::AttachThreadInput($hiloDestino, $hiloActual, $false)
+            [void][W32]::AttachThreadInput($propio, $hiloActual, $false)
+            Start-Sleep -Milliseconds 200
+            if ([W32]::GetForegroundWindow() -eq $Handle) { return $true }
+        }
+
+        # Ultimo recurso: pulsar ALT concede el derecho de primer plano.
+        #
+        # Efecto secundario peligroso: si la ventana que estaba al frente es
+        # otra instancia de AC, ALT le activa la barra de menu y esa instancia
+        # entra en modo menu, donde IGNORA los clics que se le envian por
+        # mensaje y se queda colgada. Por eso se le cancela ese modo despues.
+        [W32]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+        [void][W32]::SetForegroundWindow($Handle)
+        [W32]::keybd_event(0x12, 0, [W32]::KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+        if ($anterior -ne [IntPtr]::Zero -and $anterior -ne $Handle) {
+            [void][W32]::PostMessage($anterior, 0x001F, [IntPtr]::Zero, [IntPtr]::Zero)  # WM_CANCELMODE
+        }
+        Start-Sleep -Milliseconds 220
+        if ([W32]::GetForegroundWindow() -eq $Handle) { return $true }
+        Start-Sleep -Milliseconds 200
+    }
+    return ([W32]::GetForegroundWindow() -eq $Handle)
+}
+
+function Test-PuntoEnProceso {
+    <#  Comprueba que el punto de pantalla pertenece al proceso esperado, para
+        no hacer clic sobre una ventana ajena que quedo por encima.  #>
+    param([int]$X, [int]$Y, [Parameter(Mandatory=$true)][int]$ProcessId)
+    $pt = New-Object W32+POINT
+    $pt.X = $X; $pt.Y = $Y
+    $h = [W32]::WindowFromPoint($pt)
+    if ($h -eq [IntPtr]::Zero) { return $false }
+    $procPunto = 0
+    [void][W32]::GetWindowThreadProcessId($h, [ref]$procPunto)
+    return ($procPunto -eq $ProcessId)
 }
 
 # ---------------------------------------------------------------------
