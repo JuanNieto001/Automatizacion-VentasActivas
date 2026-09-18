@@ -1,0 +1,27 @@
+# ===================================================================
+#  Nada que contenga datos de clientes o credenciales sale del equipo
+# ===================================================================
+
+# Clave de red cifrada (DPAPI) - jamas debe publicarse
+config/
+*.dat
+
+# Archivos de ventas con numeros y datos de clientes reales
+entrada/
+*.xlsx
+*.xlsm
+*.xls
+*.csv
+
+# Reportes y capturas de evidencia: contienen nombre, cedula, direccion,
+# correo y telefono de clientes reales
+salida/
+*.png
+
+# Instructivo interno: sus capturas incluyen datos personales de un cliente
+*.docx
+
+# Temporales
+*.log
+*.tmp
+~$*
