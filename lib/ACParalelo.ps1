@@ -98,6 +98,9 @@ function Start-ACInstancias {
                 UltBuscar= [datetime]::MinValue
                 Reenvios = 0
                 Consultas= 0
+                Carga    = 0
+                T0Leyendo= [datetime]::MinValue
+                Ctrls    = $null
             })
             Write-Paso "Instancia $i de $Cantidad lista (PID $($ctx.ProcessId))" "OK"
         } catch {
@@ -123,9 +126,18 @@ function Invoke-ACConsultaMasiva {
         [string]$BaseDatos = 'AC_PRODUCCION',
         [scriptblock]$OnResultado,
         [int]$TimeoutPorNumeroSeg = 75,
+        # Plazo mas corto para el caso "la ventana abrio pero el arbol esta
+        # vacio", que es como se resuelven los numeros que no existen en AC.
+        # 0 lo desactiva y se vuelve al plazo completo. 45 s deja margen sobre
+        # la consulta mas lenta que si encontro (47 s en total, y de esos solo
+        # una parte con el arbol vacio).
+        [int]$TimeoutVacioSeg = 45,
         [int]$IntervaloMs = 250,
         [int]$MaxReenvios = 4,
+        # Se mide en BUSCAR enviados, no en numeros resueltos: ver el reciclado
+        # preventivo mas abajo.
         [int]$ReciclarCada = 150,
+        [int]$MaxRevivir = 3,
         [switch]$Trace
     )
 
@@ -135,6 +147,8 @@ function Invoke-ACConsultaMasiva {
     $resultados = New-Object System.Collections.ArrayList
     $tiempos    = New-Object System.Collections.ArrayList
     $swGlobal   = [Diagnostics.Stopwatch]::StartNew()
+    $rondasRevivir = 0
+    $incompleto    = $false
 
     function Publicar {
         param($Inst, $Res)
@@ -150,6 +164,9 @@ function Invoke-ACConsultaMasiva {
         $Inst.Consultas = $Inst.Consultas + 1
         $Inst.Numero   = $null
         $Inst.Intentos = 0
+        # la ventana de resultados ya se cerro: sus handles no sirven para el
+        # siguiente numero
+        $Inst.Ctrls    = $null
     }
 
     while ($cola.Count -gt 0 -or ($Instancias | Where-Object { $_.Estado -ne 'libre' })) {
@@ -176,10 +193,18 @@ function Invoke-ACConsultaMasiva {
             # instancias se degradan y acaban cerrandose solas, y antes de
             # caerse empiezan a devolver "NO ENCONTRADO" falsos. Reiniciarlas
             # cada cierto numero de consultas evita ese deterioro.
+            #
+            # Lo que desgasta a AC son los BUSCAR enviados, no los numeros
+            # resueltos: un numero que existe cuesta un BUSCAR, pero uno que no
+            # aparece agota el timeout y cuesta 1 + MaxReenvios. Contando
+            # numeros, un lote donde casi nada existe desgasta cinco veces mas
+            # rapido de lo que el contador refleja y las instancias mueren
+            # antes de alcanzar el umbral (visto el 21-sep: murieron a las ~28
+            # consultas, con el umbral en 150). Por eso se cuenta la carga.
             if ($inst.Estado -eq 'libre' -and $ReciclarCada -gt 0 -and $Password -and
-                $inst.Consultas -ge $ReciclarCada -and $cola.Count -gt 0) {
+                $inst.Carga -ge $ReciclarCada -and $cola.Count -gt 0) {
 
-                Write-Paso "Instancia $($inst.Indice): reciclando tras $($inst.Consultas) consultas" "INFO"
+                Write-Paso "Instancia $($inst.Indice): reciclando tras $($inst.Consultas) consultas ($($inst.Carga) busquedas)" "INFO"
                 try { (Get-Process -Id $inst.Fijos.ProcessId -ErrorAction SilentlyContinue).Kill() } catch { }
                 Start-Sleep -Seconds 2
                 try {
@@ -188,6 +213,7 @@ function Invoke-ACConsultaMasiva {
                     if (-not $fj) { throw "sin panel de criterios" }
                     $inst.Fijos = $fj
                     $inst.Consultas = 0
+                    $inst.Carga = 0
                 } catch {
                     Write-Paso "Instancia $($inst.Indice): no se pudo reiniciar ($($_.Exception.Message))" "WARN"
                     $inst.Estado = 'muerta'
@@ -225,6 +251,7 @@ function Invoke-ACConsultaMasiva {
                         Start-Sleep -Milliseconds 400
                         $inst.UltBuscar = Get-Date
                         $inst.Reenvios  = 0
+                        $inst.Carga     = $inst.Carga + 1
                         $inst.Estado = 'esperando'
                     } catch {
                         Publicar -Inst $inst -Res ([pscustomobject]@{
@@ -239,7 +266,9 @@ function Invoke-ACConsultaMasiva {
             elseif ($inst.Estado -eq 'esperando') {
                 $transcurrido = ((Get-Date) - $inst.T0).TotalSeconds
                 if (Get-VentanaResultados -Fijos $inst.Fijos) {
-                    $inst.Estado = 'leyendo'
+                    $inst.Estado     = 'leyendo'
+                    $inst.T0Leyendo  = Get-Date
+                    $inst.Ctrls      = $null
                 }
                 else {
                     $resuelto = $false
@@ -267,6 +296,7 @@ function Invoke-ACConsultaMasiva {
                         if ($Trace) { Write-Host ("    [traza inst {0}] reenviando BUSCAR (intento {1})" -f $inst.Indice, $inst.Reenvios) -ForegroundColor DarkGray }
                         [void](Invoke-ACClicActivado -Fijos $inst.Fijos -Control $inst.Fijos.Buscar.Handle -Cebo $inst.Fijos.Radio.Handle)
                         $inst.UltBuscar = Get-Date
+                        $inst.Carga     = $inst.Carga + 1
                     }
 
                     if (-not $resuelto -and $transcurrido -gt $TimeoutPorNumeroSeg) {
@@ -293,9 +323,19 @@ function Invoke-ACConsultaMasiva {
                     }
                 }
                 else {
-                    $k  = Get-ChildHandles -Parent $vent.Handle
-                    $tv = $k | Where-Object { $_.Class -like 'TreeView*' } | Select-Object -First 1
-                    $lv = $k | Where-Object { $_.Class -like 'ListView*' } | Select-Object -First 1
+                    # Los handles del arbol y la grilla se resuelven una sola vez
+                    # por consulta: enumerar los hijos cuatro veces por segundo
+                    # durante toda la espera recargaba a AC sin necesidad.
+                    if (-not $inst.Ctrls -or $inst.Ctrls.Vent -ne $vent.Handle) {
+                        $k = Get-ChildHandles -Parent $vent.Handle
+                        $inst.Ctrls = [pscustomobject]@{
+                            Vent = $vent.Handle
+                            Tv   = ($k | Where-Object { $_.Class -like 'TreeView*' } | Select-Object -First 1)
+                            Lv   = ($k | Where-Object { $_.Class -like 'ListView*' } | Select-Object -First 1)
+                        }
+                    }
+                    $tv = $inst.Ctrls.Tv
+                    $lv = $inst.Ctrls.Lv
 
                     if ($tv -and $lv) {
                         # sondeo barato: un solo mensaje, sin memoria remota
@@ -316,14 +356,32 @@ function Invoke-ACConsultaMasiva {
                             # Seleccionar la linea en el arbol, pero solo cuando
                             # el nodo ya existe: si se hace antes, AC ignora el
                             # clic y se pierde mas de un segundo por consulta.
+                            $nodos = Get-TreeViewCount -Hwnd $tv.Handle
                             if (((Get-Date) - $inst.UltClic).TotalMilliseconds -gt 800) {
-                                if ((Get-TreeViewCount -Hwnd $tv.Handle) -gt 0) {
+                                if ($nodos -gt 0) {
                                     [void](Invoke-ACClicActivado -Fijos $inst.Fijos -Control $tv.Handle -X 60 -Y 10)
                                     $inst.UltClic = Get-Date
                                     $inst.Intentos++
                                 }
                             }
-                            if ($transcurrido -gt $TimeoutPorNumeroSeg) {
+
+                            # Arbol vacio = la busqueda no trajo nada. Medido en
+                            # 1409 consultas que si encontraron: mediana 10.2 s,
+                            # p90 14 s, maximo 47 s. Seguir esperando 75 s por
+                            # cada numero inexistente costo 87 de los 350 min de
+                            # esa corrida y desgasta las instancias hasta
+                            # tumbarlas, asi que se corta antes. Los cortados por
+                            # aqui se reintentan luego con el plazo completo.
+                            $esperaVacio = ((Get-Date) - $inst.T0Leyendo).TotalSeconds
+                            if ($nodos -eq 0 -and $TimeoutVacioSeg -gt 0 -and $esperaVacio -gt $TimeoutVacioSeg) {
+                                $msgs = Close-ACDialogs -ProcessId $inst.Fijos.ProcessId
+                                Publicar -Inst $inst -Res ([pscustomobject]@{
+                                    Numero = $inst.Numero; Encontrado = $false
+                                    Mensaje = if ($msgs) { $msgs -join ' | ' } else { "La busqueda no devolvio ninguna linea." }
+                                    Filas = @()
+                                })
+                            }
+                            elseif ($transcurrido -gt $TimeoutPorNumeroSeg) {
                                 $msgs = Close-ACDialogs -ProcessId $inst.Fijos.ProcessId
                                 Publicar -Inst $inst -Res ([pscustomobject]@{
                                     Numero = $inst.Numero; Encontrado = $false
@@ -341,7 +399,38 @@ function Invoke-ACConsultaMasiva {
             Start-Sleep -Milliseconds $IntervaloMs
         }
         if (($Instancias | Where-Object { $_.Estado -ne 'muerta' }).Count -eq 0) {
-            throw "Todas las instancias de AC se cerraron."
+            # Caida general. Antes se lanzaba una excepcion, con lo que la
+            # corrida entera se perdia aunque faltaran pocos numeros; ahora se
+            # intenta levantar de nuevo y, si no se puede, se devuelve lo
+            # alcanzado para que quien llame lo guarde igual.
+            $revividas = 0
+            if ($Password -and $rondasRevivir -lt $MaxRevivir) {
+                $rondasRevivir++
+                Write-Paso "Todas las instancias cayeron; intento $rondasRevivir de $MaxRevivir para levantarlas" "WARN"
+                foreach ($inst in $Instancias) {
+                    try {
+                        $ctxN = Start-ACInstancia -Password $Password -BaseDatos $BaseDatos -Silencioso
+                        $fj = Get-ACControlesFijos -ProcessId $ctxN.ProcessId
+                        if (-not $fj) { throw "sin panel de criterios" }
+                        $inst.Fijos     = $fj
+                        $inst.Carga     = 0
+                        $inst.Consultas = 0
+                        $inst.Numero    = $null
+                        $inst.Intentos  = 0
+                        $inst.Estado    = 'libre'
+                        $revividas++
+                        Write-Paso "Instancia $($inst.Indice): levantada de nuevo (PID $($ctxN.ProcessId))" "OK"
+                    } catch {
+                        Write-Paso "Instancia $($inst.Indice): no se pudo levantar ($($_.Exception.Message))" "WARN"
+                    }
+                }
+            }
+            if ($revividas -eq 0) {
+                $incompleto = $true
+                Write-Paso ("Sin instancias de AC: se devuelven los {0} de {1} numeros ya resueltos." -f `
+                            $resultados.Count, $Numeros.Count) "ERROR"
+                break
+            }
         }
     }
 
@@ -353,6 +442,10 @@ function Invoke-ACConsultaMasiva {
         SegundosPorNumero = if ($resultados.Count) { [Math]::Round($swGlobal.Elapsed.TotalSeconds / $resultados.Count, 2) } else { 0 }
         LatenciaMedia     = if ($tiempos.Count) { [Math]::Round(($tiempos | Measure-Object -Average).Average, 2) } else { 0 }
         InstanciasVivas   = $vivas
+        # Incompleto = AC se quedo sin instancias antes de terminar la cola.
+        # Los que faltan quedan en Pendientes para reintentarlos aparte.
+        Incompleto        = $incompleto
+        Pendientes        = @($cola.ToArray())
     }
 }
 

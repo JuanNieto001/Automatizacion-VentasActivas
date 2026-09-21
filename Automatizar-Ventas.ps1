@@ -43,6 +43,9 @@ param(
     [string]   $ExcelSalida,
     [int]      $Limite = 0,
     [int]      $MaxReintentos = 2,
+    # Segundos de espera cuando AC abre la ventana de resultados pero no trae
+    # ninguna linea. 0 = esperar el plazo completo (mas lento, para repasar).
+    [int]      $TimeoutVacioSeg = 45,
     [ValidateRange(1, 12)]
     [int]      $Instancias = 1
 )
@@ -211,7 +214,7 @@ $total  = $listaNumeros.Count
 $porNumero = @{}
 
 $stats = Invoke-ACConsultaMasiva -Numeros $listaNumeros -Instancias $pool `
-            -Password $clave -BaseDatos $BaseDatos -OnResultado {
+            -Password $clave -BaseDatos $BaseDatos -TimeoutVacioSeg $TimeoutVacioSeg -OnResultado {
     param($r)
     $script:hechos++
     $reg = New-Registro -Numero $r.Numero
@@ -265,6 +268,20 @@ Write-Host ("Pasada 1: {0} numeros en {1} s  |  {2} s por numero  |  {3} instanc
 Write-Host ("Latencia media de cada consulta: {0} s" -f $stats.LatenciaMedia) -ForegroundColor Gray
 if ($Instancias -gt 1 -and $stats.SegundosPorNumero -gt 0) {
     Write-Host ("Rendimiento: {0} numeros por minuto" -f [Math]::Round(60 / $stats.SegundosPorNumero, 1)) -ForegroundColor Gray
+}
+
+# Si AC se quedo sin instancias, la pasada 1 quedo a medias. Se avisa y se
+# deja la lista de lo que falto, para reintentarla sin repetir la corrida.
+if ($stats.Incompleto) {
+    $faltantes = @($stats.Pendientes)
+    Write-Host ""
+    Write-Host ("ATENCION: la pasada 1 quedo INCOMPLETA. Faltaron {0} numeros." -f $faltantes.Count) -ForegroundColor Red
+    if ($faltantes.Count) {
+        $archivoFaltan = Join-Path $dirSalida "pendientes_$sello.txt"
+        Set-Content -LiteralPath $archivoFaltan -Value $faltantes -Encoding ASCII
+        Write-Host ("Quedaron listados en: {0}" -f $archivoFaltan) -ForegroundColor Red
+        Write-Host  "Reintentalos con:  .\Automatizar-Ventas.ps1 -Numeros (Get-Content '$archivoFaltan') -SoloEstado" -ForegroundColor Gray
+    }
 }
 
 # ---------------------------------------------------------------------
