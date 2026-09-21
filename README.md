@@ -55,8 +55,13 @@ descifrar con tu cuenta en este mismo equipo**, y nunca se guarda en texto plano
 | `-Columna` | Columna del Excel con los números | `E` |
 | `-FilaInicio` | Primera fila con datos (salta el encabezado) | `2` |
 | `-Hoja` | Nombre de la hoja del libro | la primera |
-| `-HistorialSiempre` | Consulta el historial de todas las líneas | solo las no activas |
+| `-Hoja` | Nombre de la hoja del libro (p. ej. `CONSOLIDADO`) | la primera |
+| `-HistorialSiempre` | Consulta el motivo de todas las líneas | solo las no activas |
+| `-SoloEstado` | Solo activa/no activa, sin motivos (mucho más rápido) | — |
+| `-MotivoRapido` | Lee el motivo de la ficha en vez del historial: 28 s por línea en vez de 67, pero sin la fecha del movimiento | — |
+| `-Limite` | Procesa solo los primeros N números (para pruebas) | todos |
 | `-Instancias` | Cuántas copias de AC consultan en paralelo (1-12) | `1` |
+| `-ExcelSalida` | Ruta del Excel resultante | `salida\<nombre> - VERIFICADO <fecha>.xlsx` |
 | `-BaseDatos` | Base de AC | `AC_PRODUCCION` |
 | `-GuardarClave` | Guarda la clave cifrada y sale | — |
 | `-Salida` | Ruta del CSV de salida | `salida\ventas_<fecha>.csv` |
@@ -87,6 +92,22 @@ Los números se normalizan solos: quita espacios y guiones, y el indicativo
 
 Además, en `salida\capturas_<fecha>\` queda una captura de la pantalla
 HISTORIAL de cada línea revisada, como evidencia.
+
+### El Excel de vuelta
+
+Si la entrada es un `.xlsx`, se devuelve **el mismo libro** con cuatro columnas
+nuevas al final de la hoja procesada:
+
+| Columna | Contenido |
+|---|---|
+| `VERIFICACION` | `EXITOSA` / `NO EXITOSA` / `NO ENCONTRADA` / `ERROR` |
+| `ESTADO AC` | Estado tal cual lo muestra AC |
+| `MOTIVO` | Por qué no está activa |
+| `FECHA VERIFICACION` | Fecha en que se corrió la verificación |
+
+Las filas de la hoja cuyo número no se alcanzó a verificar quedan como
+`NO VERIFICADO`. El resto del libro no se toca: formatos, fórmulas, tablas
+dinámicas y las demás hojas quedan igual.
 
 ---
 

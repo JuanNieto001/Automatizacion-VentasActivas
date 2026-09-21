@@ -97,6 +97,7 @@ function Start-ACInstancias {
                 UltClic  = [datetime]::MinValue
                 UltBuscar= [datetime]::MinValue
                 Reenvios = 0
+                Consultas= 0
             })
             Write-Paso "Instancia $i de $Cantidad lista (PID $($ctx.ProcessId))" "OK"
         } catch {
@@ -118,10 +119,13 @@ function Invoke-ACConsultaMasiva {
     param(
         [Parameter(Mandatory=$true)][string[]]$Numeros,
         [Parameter(Mandatory=$true)]$Instancias,
+        [string]$Password,
+        [string]$BaseDatos = 'AC_PRODUCCION',
         [scriptblock]$OnResultado,
         [int]$TimeoutPorNumeroSeg = 75,
         [int]$IntervaloMs = 250,
         [int]$MaxReenvios = 4,
+        [int]$ReciclarCada = 150,
         [switch]$Trace
     )
 
@@ -143,6 +147,7 @@ function Invoke-ACConsultaMasiva {
         # dejar la instancia lista para el siguiente numero
         Close-ACResultados -ProcessId $Inst.Fijos.ProcessId
         $Inst.Estado   = 'libre'
+        $Inst.Consultas = $Inst.Consultas + 1
         $Inst.Numero   = $null
         $Inst.Intentos = 0
     }
@@ -164,6 +169,30 @@ function Invoke-ACConsultaMasiva {
                 $inst.Estado = 'muerta'
                 Write-Paso "La instancia $($inst.Indice) se cerro; se continua con las demas." "WARN"
                 continue
+            }
+
+            # --- reciclado preventivo ---
+            # Medido en una corrida de 1712 numeros: tras ~400 consultas las
+            # instancias se degradan y acaban cerrandose solas, y antes de
+            # caerse empiezan a devolver "NO ENCONTRADO" falsos. Reiniciarlas
+            # cada cierto numero de consultas evita ese deterioro.
+            if ($inst.Estado -eq 'libre' -and $ReciclarCada -gt 0 -and $Password -and
+                $inst.Consultas -ge $ReciclarCada -and $cola.Count -gt 0) {
+
+                Write-Paso "Instancia $($inst.Indice): reciclando tras $($inst.Consultas) consultas" "INFO"
+                try { (Get-Process -Id $inst.Fijos.ProcessId -ErrorAction SilentlyContinue).Kill() } catch { }
+                Start-Sleep -Seconds 2
+                try {
+                    $ctxN = Start-ACInstancia -Password $Password -BaseDatos $BaseDatos -Silencioso
+                    $fj = Get-ACControlesFijos -ProcessId $ctxN.ProcessId
+                    if (-not $fj) { throw "sin panel de criterios" }
+                    $inst.Fijos = $fj
+                    $inst.Consultas = 0
+                } catch {
+                    Write-Paso "Instancia $($inst.Indice): no se pudo reiniciar ($($_.Exception.Message))" "WARN"
+                    $inst.Estado = 'muerta'
+                    continue
+                }
             }
 
             # ---------------- libre: tomar el siguiente numero ----------------
@@ -326,4 +355,5 @@ function Invoke-ACConsultaMasiva {
         InstanciasVivas   = $vivas
     }
 }
+
 

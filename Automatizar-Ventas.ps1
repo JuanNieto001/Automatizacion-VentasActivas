@@ -210,7 +210,8 @@ $hechos = 0
 $total  = $listaNumeros.Count
 $porNumero = @{}
 
-$stats = Invoke-ACConsultaMasiva -Numeros $listaNumeros -Instancias $pool -OnResultado {
+$stats = Invoke-ACConsultaMasiva -Numeros $listaNumeros -Instancias $pool `
+            -Password $clave -BaseDatos $BaseDatos -OnResultado {
     param($r)
     $script:hechos++
     $reg = New-Registro -Numero $r.Numero
