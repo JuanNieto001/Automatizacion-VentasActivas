@@ -46,6 +46,12 @@ param(
     # Segundos de espera cuando AC abre la ventana de resultados pero no trae
     # ninguna linea. 0 = esperar el plazo completo (mas lento, para repasar).
     [int]      $TimeoutVacioSeg = 45,
+    # La portabilidad tarda dias habiles en quedar aprovisionada: una venta de
+    # ayer aparece como desactivada o ni siquiera existe, y su historial no
+    # dice nada util. Con esto la pasada 2 se salta las ventas mas nuevas que
+    # N dias. 0 = no saltarse ninguna.
+    [int]      $DiasMinimos = 0,
+    [string]   $ColumnaFecha = 'B',
     [ValidateRange(1, 12)]
     [int]      $Instancias = 1
 )
@@ -120,6 +126,8 @@ Write-Titulo "VERIFICACION DE VENTAS EN AC"
 
 $listaNumeros = @()
 $origen = ""
+# numero -> fecha de venta, solo se llena si se pidio -DiasMinimos
+$fechaVenta = @{}
 
 if ($Numeros -and $Numeros.Count -gt 0) {
     foreach ($n in $Numeros) {
@@ -145,6 +153,36 @@ if ($Numeros -and $Numeros.Count -gt 0) {
     $origen = $Archivo
     if ($lec.Descartados -gt 0) {
         Write-Host "Se descartaron $($lec.Descartados) celdas que no son numeros de 10 digitos." -ForegroundColor Yellow
+    }
+
+    # Fecha de venta de cada numero, para poder saltarse en la pasada 2 las
+    # ventas que todavia no alcanzaron a aprovisionarse.
+    if ($DiasMinimos -gt 0 -and [System.IO.Path]::GetExtension($Archivo) -in '.xlsx', '.xlsm') {
+        try {
+            $celdasF = Get-XlsxCeldas -Path $Archivo -Hoja $Hoja
+            $baseExcel = [datetime]'1899-12-30'
+            foreach ($k in $celdasF.Keys) {
+                if ($k -notmatch "^$Columna(\d+)$") { continue }
+                $fila = [int]$Matches[1]
+                if ($fila -lt $FilaInicio) { continue }
+                $num = ConvertTo-NumeroLimpio $celdasF["$Columna$fila"]
+                if (-not $num) { continue }
+                $cru = "$($celdasF["$ColumnaFecha$fila"])".Trim()
+                $ser = 0
+                # Excel guarda las fechas como numero de serie; si viniera como
+                # texto se intenta interpretarlo igual.
+                $fec = if ([double]::TryParse($cru, [ref]$ser) -and $ser -gt 1000) {
+                           $baseExcel.AddDays([Math]::Floor($ser))
+                       } else {
+                           try { [datetime]$cru } catch { $null }
+                       }
+                if ($fec) { $fechaVenta[$num] = $fec }
+            }
+            Write-Host ("Fechas de venta leidas de la columna {0}: {1}" -f $ColumnaFecha, $fechaVenta.Count)
+        } catch {
+            Write-Host ("No se pudieron leer las fechas de venta ({0}); -DiasMinimos quedara sin efecto." -f `
+                        $_.Exception.Message) -ForegroundColor Yellow
+        }
     }
 }
 
@@ -296,6 +334,28 @@ if ($SoloEstado) {
     $pendientes = @($resultados | Where-Object {
         $_.ENCONTRADO -eq 'SI' -and ($HistorialSiempre -or $_.ACTIVA -ne 'SI')
     })
+
+    # Las ventas demasiado recientes aun no terminaron de aprovisionarse: su
+    # historial no explica nada y cada una cuesta ~28 s. Se dejan marcadas.
+    if ($DiasMinimos -gt 0 -and $fechaVenta.Count -gt 0) {
+        $hoy = Get-Date
+        $recientes = @($pendientes | Where-Object {
+            $f = $fechaVenta[$_.NUMERO]
+            $f -and ($hoy - $f).TotalDays -lt $DiasMinimos
+        })
+        if ($recientes.Count -gt 0) {
+            foreach ($reg in $recientes) {
+                $dias = [int]($hoy - $fechaVenta[$reg.NUMERO]).TotalDays
+                $reg.MOTIVO = "Venta de hace $dias dias: aun en tramite, no se consulto el motivo."
+            }
+            $omitidos = $recientes.Count
+            $pendientes = @($pendientes | Where-Object { $recientes -notcontains $_ })
+            Write-Host ""
+            Write-Host ("Se omiten {0} lineas de ventas con menos de {1} dias (-DiasMinimos): todavia" -f `
+                        $omitidos, $DiasMinimos) -ForegroundColor Yellow
+            Write-Host  "estan en tramite y su historial no diria el motivo real." -ForegroundColor Yellow
+        }
+    }
 }
 
 if ($pendientes.Count -gt 0) {
