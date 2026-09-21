@@ -101,6 +101,18 @@ function Write-ZipOpc {
     }
     foreach ($k in $archivos.Keys) { if (-not $orden.Contains($k)) { [void]$orden.Add($k) } }
 
+    # [Content_Types].xml debe ser la primera entrada del paquete OPC.
+    foreach ($primero in @('[Content_Types].xml', '_rels/.rels')) {
+        if ($orden.Contains($primero)) {
+            $orden.Remove($primero)
+            $orden.Insert(0, $primero)
+        }
+    }
+    if ($orden.Contains('[Content_Types].xml')) {
+        $orden.Remove('[Content_Types].xml')
+        $orden.Insert(0, '[Content_Types].xml')
+    }
+
     $zip = [System.IO.Compression.ZipFile]::Open($Destino, [System.IO.Compression.ZipArchiveMode]::Create)
     try {
         foreach ($nombre in $orden) {
