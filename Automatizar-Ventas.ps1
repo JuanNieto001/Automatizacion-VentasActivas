@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SINOPSIS
     Verifica en AC (Administracion de Clientes) que ventas quedaron activas,
     cuales no, y el motivo de las que no lo estan.
@@ -37,7 +37,11 @@ param(
     [switch]   $GuardarClave,
     [string]   $BaseDatos  = 'AC_PRODUCCION',
     [switch]   $HistorialSiempre,
+    [switch]   $MotivoRapido,
+    [switch]   $SoloEstado,
     [string]   $Salida,
+    [string]   $ExcelSalida,
+    [int]      $Limite = 0,
     [int]      $MaxReintentos = 2,
     [ValidateRange(1, 12)]
     [int]      $Instancias = 1
@@ -51,6 +55,7 @@ $raiz = Split-Path -Parent $MyInvocation.MyCommand.Path
 . "$raiz\lib\AC.ps1"
 . "$raiz\lib\ACParalelo.ps1"
 . "$raiz\lib\Excel.ps1"
+. "$raiz\lib\ExcelEscribir.ps1"
 
 $dirEntrada = Join-Path $raiz 'entrada'
 $dirSalida  = Join-Path $raiz 'salida'
@@ -74,7 +79,9 @@ function Write-Titulo {
 
 function Save-Clave {
     $sec = Read-Host "Clave de red de $env:USERDOMAIN\$env:USERNAME" -AsSecureString
-    $sec | ConvertFrom-SecureString | Set-Content -LiteralPath $archivoClave -Encoding UTF8
+    # ASCII a proposito: el cifrado DPAPI es una cadena hexadecimal, y un BOM
+    # de UTF-8 al principio del archivo rompe la lectura posterior.
+    $sec | ConvertFrom-SecureString | Set-Content -LiteralPath $archivoClave -Encoding ASCII
     Write-Host "Clave guardada cifrada en $archivoClave" -ForegroundColor Green
     Write-Host "Solo se puede descifrar con tu usuario de Windows en este equipo." -ForegroundColor Gray
 }
@@ -84,7 +91,9 @@ function Get-Clave {
     if ($Explicita) { return $Explicita }
     if (Test-Path -LiteralPath $archivoClave) {
         try {
-            $sec = Get-Content -LiteralPath $archivoClave -Raw | ConvertTo-SecureString
+            # se limpian BOM y espacios por si el archivo se guardo en UTF-8
+            $txt = (Get-Content -LiteralPath $archivoClave -Raw).Trim([char]0xFEFF, [char]0x200B, ' ', "`r", "`n", "`t")
+            $sec = $txt | ConvertTo-SecureString
             $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
             try   { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
             finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
@@ -137,7 +146,15 @@ if ($Numeros -and $Numeros.Count -gt 0) {
 }
 
 if ($listaNumeros.Count -eq 0) { throw "No hay numeros que verificar." }
+
+$totalDisponibles = $listaNumeros.Count
+if ($Limite -gt 0 -and $listaNumeros.Count -gt $Limite) {
+    $listaNumeros = @($listaNumeros | Select-Object -First $Limite)
+    Write-Host "Limitado a los primeros $Limite de $totalDisponibles numeros (-Limite)." -ForegroundColor Yellow
+}
+
 Write-Host "Origen : $origen"
+if ($Hoja) { Write-Host "Hoja   : $Hoja" }
 Write-Host "Numeros: $($listaNumeros.Count)"
 Write-Host "Modo   : $(if ($HistorialSiempre) { 'historial para TODOS los numeros' } else { 'historial solo para las lineas NO activas' })"
 
@@ -168,6 +185,7 @@ function New-Registro {
         TECNOLOGIA          = ''
         TIPO_CLIENTE        = ''
         CENTRO_COSTOS       = ''
+        HISTORIAL_MOVIMIENTOS = ''
         HISTORIAL_COMPLETO  = ''
         OBSERVACION         = ''
         CONSULTADO          = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
@@ -229,6 +247,13 @@ $stats = Invoke-ACConsultaMasiva -Numeros $listaNumeros -Instancias $pool -OnRes
     [void]$script:resultados.Add([pscustomobject]$reg)
     Write-Host ("  [{0}/{1}] {2}  {3}  ({4}s, inst {5})" -f `
         $script:hechos, $script:total, $r.Numero, $txt, $r.Segundos, $r.Instancia) -ForegroundColor $col
+
+    # Guardado parcial: en una corrida larga no se puede perder todo por un
+    # fallo al final. Se reescribe el CSV cada 50 numeros.
+    if (($script:hechos % 50) -eq 0) {
+        try { $script:resultados | Export-Csv -LiteralPath $script:Salida -NoTypeInformation -Encoding UTF8 } catch { }
+        Write-Host ("       ... parcial guardado ({0} numeros)" -f $script:hechos) -ForegroundColor DarkGray
+    }
 }
 
 Stop-ACSession -Todas
@@ -245,17 +270,25 @@ if ($Instancias -gt 1 -and $stats.SegundosPorNumero -gt 0) {
 #  PASADA 2 - motivo de las lineas que no estan activas
 # ---------------------------------------------------------------------
 
-$pendientes = @($resultados | Where-Object {
-    $_.ENCONTRADO -eq 'SI' -and ($HistorialSiempre -or $_.ACTIVA -ne 'SI')
-})
+if ($SoloEstado) {
+    $pendientes = @()
+    Write-Host ""
+    Write-Host "Modo -SoloEstado: no se consultan motivos." -ForegroundColor Yellow
+} else {
+    $pendientes = @($resultados | Where-Object {
+        $_.ENCONTRADO -eq 'SI' -and ($HistorialSiempre -or $_.ACTIVA -ne 'SI')
+    })
+}
 
 if ($pendientes.Count -gt 0) {
     Write-Titulo "PASADA 2 - MOTIVO (HISTORIAL, Ctrl+Shift+H)"
     Write-Host "Lineas por revisar: $($pendientes.Count)"
-    Write-Host "AC se reinicia despues de cada ficha: es la unica forma de cerrarla sin guardar un Tickler." -ForegroundColor Gray
-    Write-Host "Esta pasada SI usa el raton y una sola instancia: no toques el equipo mientras corre." -ForegroundColor Yellow
+    Write-Host "Cada ficha consume una instancia de AC (no se puede cerrar sin guardar un Tickler)," -ForegroundColor Gray
+    Write-Host "asi que los reinicios se encadenan entre instancias para solapar la espera." -ForegroundColor Gray
+    Write-Host "Usa el raton: no toques el equipo mientras corre." -ForegroundColor Yellow
     Write-Host ""
 
+    $swP2 = [Diagnostics.Stopwatch]::StartNew()
     $j = 0
     foreach ($reg in $pendientes) {
         $j++
@@ -266,39 +299,76 @@ if ($pendientes.Count -gt 0) {
 
             $r = Invoke-ACBusqueda -Numero $reg.NUMERO
             if (-not $r.Encontrado) {
-                $reg.OBSERVACION = (("$($reg.OBSERVACION) No se pudo reabrir para el historial: $($r.Mensaje)").Trim())
+                $reg.OBSERVACION = (("$($reg.OBSERVACION) No se pudo reabrir para el motivo: $($r.Mensaje)").Trim())
+                Write-Paso "No se pudo reabrir: $($r.Mensaje)" "WARN"
                 continue
             }
 
-            [void](Open-ACFicha)
-            $h = Get-ACHistorial
+            $ctxF = Open-ACFicha
 
-            $filas = @($h.EstadoContrato.Rows)
-            if ($filas.Count -gt 0) {
-                $ultima = $filas[0].Campos
-                $reg.MOTIVO         = $ultima.MOTIVO
-                $reg.FECHA_ESTADO   = $ultima.'VALIDO DESDE'
-                $reg.USUARIO_ESTADO = $ultima.USUARIO
-                $reg.HISTORIAL_COMPLETO = (($filas | ForEach-Object {
-                    "$($_.Campos.ESTADO) / $($_.Campos.MOTIVO) / $($_.Campos.'VALIDO DESDE') / $($_.Campos.USUARIO)"
-                }) -join ' || ')
+            if ($MotivoRapido) {
+                # La ficha muestra el motivo vigente en el recuadro resaltado
+                # junto a "Estado Contrato". Verificado: coincide con la ultima
+                # fila del HISTORIAL. Ahorra los ~40 s que cuesta abrirlo, pero
+                # ese campo no trae la fecha del movimiento.
+                #
+                # Se localiza el control por su posicion relativa (barato) y se
+                # sondea SOLO ese campo: recorrer todos los campos por UI
+                # Automation en cada ciclo costaba tanto como el historial.
+                $f = (Get-ACContext).Ficha
+                $campo = Get-ChildHandles -Parent $f.Handle | Where-Object {
+                    $_.Class -like '*TextBox*' -and
+                    [Math]::Abs(($_.X - $f.X) - 279) -le 12 -and
+                    [Math]::Abs(($_.Y - $f.Y) -  80) -le 12
+                } | Select-Object -First 1
 
-                $estadoHist = "$($ultima.ESTADO)".Trim()
-                if ($estadoHist -and $estadoHist.ToUpper() -ne "$($reg.ESTADO)".Trim().ToUpper()) {
-                    $reg.OBSERVACION = (("$($reg.OBSERVACION) Ultimo movimiento del historial: '$estadoHist' (la grilla reporta '$($reg.ESTADO)').").Trim())
+                $valor = $null
+                if ($campo) {
+                    $valor = Wait-Condition -TimeoutSeg 30 -IntervaloMs 150 -Condicion {
+                        $v = Get-UiaName -Handle ([int]$campo.Handle)
+                        if ($v) { $v }
+                    }
                 }
-                Write-Paso "Motivo: $($ultima.MOTIVO) ($($ultima.ESTADO), $($ultima.'VALIDO DESDE'))" "OK"
-            } else {
-                $reg.OBSERVACION = (("$($reg.OBSERVACION) El historial no devolvio movimientos.").Trim())
-                Write-Paso "El historial no devolvio movimientos." "WARN"
+                if ($valor) {
+                    $reg.MOTIVO = $valor
+                    Write-Paso "Motivo: $valor (leido de la ficha)" "OK"
+                } else {
+                    $reg.OBSERVACION = (("$($reg.OBSERVACION) La ficha no mostro el motivo.").Trim())
+                    Write-Paso "La ficha no mostro el motivo." "WARN"
+                }
             }
-
-            [void](Save-WindowShot -Handle $h.VentanaHandle -Path (Join-Path $dirCapturas "historial_$($reg.NUMERO).png"))
+            else {
+                $h = Get-ACHistorial
+                $filas = @($h.EstadoContrato.Rows)
+                if ($filas.Count -gt 0) {
+                    # El HISTORIAL viene en orden cronologico: la PRIMERA fila es
+                    # el movimiento mas antiguo y la ULTIMA el estado vigente.
+                    # Verificado contra la grilla en varios casos.
+                    $ultima = $filas[-1].Campos
+                    $reg.MOTIVO               = $ultima.MOTIVO
+                    $reg.FECHA_ESTADO         = $ultima.'VALIDO DESDE'
+                    $reg.USUARIO_ESTADO       = $ultima.USUARIO
+                    $reg.HISTORIAL_MOVIMIENTOS = $filas.Count
+                    $reg.HISTORIAL_COMPLETO   = (($filas | ForEach-Object {
+                        "$($_.Campos.ESTADO) / $($_.Campos.MOTIVO) / $($_.Campos.'VALIDO DESDE') / $($_.Campos.USUARIO)"
+                    }) -join ' || ')
+                    Write-Paso "Motivo: $($ultima.MOTIVO) ($($ultima.ESTADO), $($ultima.'VALIDO DESDE')) - $($filas.Count) movimientos" "OK"
+                    [void](Save-WindowShot -Handle $h.VentanaHandle -Path (Join-Path $dirCapturas "historial_$($reg.NUMERO).png"))
+                } else {
+                    $reg.OBSERVACION = (("$($reg.OBSERVACION) El historial no devolvio movimientos.").Trim())
+                    Write-Paso "El historial no devolvio movimientos." "WARN"
+                }
+            }
         } catch {
-            $reg.OBSERVACION = (("$($reg.OBSERVACION) Error al consultar el historial: $($_.Exception.Message)").Trim())
+            $reg.OBSERVACION = (("$($reg.OBSERVACION) Error al consultar el motivo: $($_.Exception.Message)").Trim())
             Write-Paso "Error: $($_.Exception.Message)" "ERROR"
         }
     }
+    $swP2.Stop()
+    Write-Host ""
+    Write-Host ("Pasada 2: {0} lineas en {1:N0} s  |  {2:N1} s por linea" -f `
+        $pendientes.Count, $swP2.Elapsed.TotalSeconds,
+        ($swP2.Elapsed.TotalSeconds / [Math]::Max(1, $pendientes.Count))) -ForegroundColor Cyan
 }
 
 # ---------------------------------------------------------------------
@@ -324,7 +394,54 @@ if ($noActivas.Count -gt 0) {
 
 $resultados | Export-Csv -LiteralPath $Salida -NoTypeInformation -Encoding UTF8
 Write-Host ""
-Write-Host "Reporte: $Salida" -ForegroundColor Cyan
-if (Test-Path -LiteralPath $dirCapturas) { Write-Host "Capturas: $dirCapturas" -ForegroundColor Cyan }
+Write-Host "Reporte CSV: $Salida" -ForegroundColor Cyan
+
+# ---------------------------------------------------------------------
+#  Excel de vuelta: el mismo libro con las columnas de verificacion
+# ---------------------------------------------------------------------
+
+if ($Archivo -and ([System.IO.Path]::GetExtension($Archivo) -in '.xlsx', '.xlsm')) {
+    if (-not $ExcelSalida) {
+        $nom = [System.IO.Path]::GetFileNameWithoutExtension($Archivo)
+        $ext = [System.IO.Path]::GetExtension($Archivo)
+        $ExcelSalida = Join-Path $dirSalida "$nom - VERIFICADO $sello$ext"
+    }
+    try {
+        $mapa = @{}
+        foreach ($r in $resultados) {
+            $verif = switch ($r.ENCONTRADO) {
+                'SI'    { if ($r.ACTIVA -eq 'SI') { 'EXITOSA' } else { 'NO EXITOSA' } }
+                'NO'    { 'NO ENCONTRADA' }
+                default { 'ERROR' }
+            }
+            # el motivo: primero el del historial, si no el mensaje de AC
+            $motivo = if ($r.MOTIVO) { $r.MOTIVO } else { $r.OBSERVACION }
+            if ($r.FECHA_ESTADO) { $motivo = "$motivo ($($r.FECHA_ESTADO))".Trim() }
+            $mapa[$r.NUMERO] = [pscustomobject]@{
+                Verificacion = $verif
+                Estado       = $r.ESTADO
+                Motivo       = $motivo
+            }
+        }
+
+        $info = Add-VerificacionAExcel -Origen $Archivo -Destino $ExcelSalida -Hoja $Hoja `
+                    -Columna $Columna -FilaInicio $FilaInicio -Resultados $mapa `
+                    -Fecha (Get-Date -Format 'yyyy-MM-dd')
+
+        Write-Host ("Excel      : {0}" -f $info.Archivo) -ForegroundColor Cyan
+        Write-Host ("             hoja '{0}', columnas {1} ({2})" -f `
+            $info.Hoja, ($info.Columnas -join ', '), ($info.Encabezados -join ' / ')) -ForegroundColor Gray
+        Write-Host ("             {0} filas con verificacion, {1} sin verificar" -f `
+            $info.FilasEscritas, $info.SinResultado) -ForegroundColor Gray
+    } catch {
+        Write-Host "No se pudo generar el Excel: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "El CSV con los resultados si quedo generado." -ForegroundColor Yellow
+    }
+}
+
+if (Test-Path -LiteralPath $dirCapturas) { Write-Host "Capturas   : $dirCapturas" -ForegroundColor Cyan }
 
 try { Stop-ACSession -Todas } catch { }
+
+
+

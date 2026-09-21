@@ -29,21 +29,43 @@ function Get-XlsxCeldas {
         }
 
         # --- hoja a leer ---
-        $hojas = Get-ChildItem -LiteralPath (Join-Path $tmp "xl\worksheets") -Filter *.xml -ErrorAction SilentlyContinue |
-                 Sort-Object Name
-        if (-not $hojas) { throw "El archivo no contiene hojas de calculo." }
+        # El nombre de archivo (sheet1.xml, sheet2.xml...) NO corresponde al
+        # orden ni al nombre de las hojas: hay que resolverlo por el r:id de
+        # workbook.xml contra workbook.xml.rels.
+        $wbPath = Join-Path $tmp "xl\workbook.xml"
+        if (-not (Test-Path -LiteralPath $wbPath)) { throw "El archivo no tiene workbook.xml." }
+        [xml]$wb = Get-Content -LiteralPath $wbPath -Encoding UTF8
+        [xml]$rl = Get-Content -LiteralPath (Join-Path $tmp "xl\_rels\workbook.xml.rels") -Encoding UTF8
 
-        $archivoHoja = $hojas[0].FullName
+        $destinos = @{}
+        foreach ($r in $rl.Relationships.Relationship) { $destinos[$r.Id] = $r.Target }
+
+        $nsRel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+        $listaHojas = @()
+        foreach ($s in $wb.workbook.sheets.sheet) {
+            $rid = $s.id
+            if (-not $rid) { $rid = $s.GetAttribute("id", $nsRel) }
+            $listaHojas += [pscustomobject]@{ Nombre = $s.name; Rid = $rid; Target = $destinos[$rid] }
+        }
+        if ($listaHojas.Count -eq 0) { throw "El archivo no contiene hojas de calculo." }
+
+        $elegida = $null
         if ($Hoja) {
-            $wbPath = Join-Path $tmp "xl\workbook.xml"
-            if (Test-Path -LiteralPath $wbPath) {
-                [xml]$wb = Get-Content -LiteralPath $wbPath -Encoding UTF8
-                $i = 0
-                foreach ($s in $wb.workbook.sheets.sheet) {
-                    if ($s.name -eq $Hoja -and $i -lt $hojas.Count) { $archivoHoja = $hojas[$i].FullName }
-                    $i++
-                }
+            $elegida = $listaHojas | Where-Object { $_.Nombre -and $_.Nombre.Trim() -ieq $Hoja.Trim() } | Select-Object -First 1
+            if (-not $elegida) {
+                $elegida = $listaHojas | Where-Object { $_.Nombre -and $_.Nombre -ilike "*$($Hoja.Trim())*" } | Select-Object -First 1
             }
+            if (-not $elegida) {
+                throw "No existe la hoja '$Hoja'. Hojas disponibles: $(($listaHojas | ForEach-Object { $_.Nombre }) -join ', ')"
+            }
+        } else {
+            $elegida = $listaHojas[0]
+        }
+
+        $rel = $elegida.Target -replace '^/xl/', '' -replace '^/', ''
+        $archivoHoja = Join-Path $tmp ("xl\" + ($rel -replace '/', '\'))
+        if (-not (Test-Path -LiteralPath $archivoHoja)) {
+            throw "No se encontro el XML de la hoja '$($elegida.Nombre)' ($($elegida.Target))."
         }
 
         [xml]$sh = Get-Content -LiteralPath $archivoHoja -Encoding UTF8

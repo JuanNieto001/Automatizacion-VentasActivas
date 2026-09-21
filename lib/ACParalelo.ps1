@@ -1,4 +1,4 @@
-# =====================================================================
+﻿# =====================================================================
 #  ACParalelo.ps1 - Consulta de estado con varias instancias de AC a la vez
 #
 #  Solo aplica a la pasada de ESTADO (activo / no activo), que se maneja
@@ -55,6 +55,10 @@ function Invoke-ACClicActivado {
         Start-Sleep -Milliseconds 120
     }
     Invoke-PostClick -Handle $Control -X $X -Y $Y
+    # El clic va POSTEADO: queda en la cola de AC. Hay que darle tiempo a
+    # procesarlo MIENTRAS esta ventana sigue en primer plano, porque si otra
+    # instancia se lo roba antes, AC lo descarta y la consulta se pierde.
+    Start-Sleep -Milliseconds 400
     return $true
 }
 
@@ -91,6 +95,8 @@ function Start-ACInstancias {
                 T0       = $null
                 Intentos = 0
                 UltClic  = [datetime]::MinValue
+                UltBuscar= [datetime]::MinValue
+                Reenvios = 0
             })
             Write-Paso "Instancia $i de $Cantidad lista (PID $($ctx.ProcessId))" "OK"
         } catch {
@@ -115,6 +121,7 @@ function Invoke-ACConsultaMasiva {
         [scriptblock]$OnResultado,
         [int]$TimeoutPorNumeroSeg = 75,
         [int]$IntervaloMs = 250,
+        [int]$MaxReenvios = 4,
         [switch]$Trace
     )
 
@@ -184,6 +191,11 @@ function Invoke-ACConsultaMasiva {
                         $leido = Set-CtrlText -Handle $inst.Fijos.Edit.Handle -Text $num
                         if ($leido -ne $num) { throw "el campo Criterio quedo en '$leido'" }
                         Invoke-PostClick -Handle $inst.Fijos.Buscar.Handle
+                        # ver Invoke-ACClicActivado: el clic debe procesarse
+                        # mientras esta instancia sigue en primer plano
+                        Start-Sleep -Milliseconds 400
+                        $inst.UltBuscar = Get-Date
+                        $inst.Reenvios  = 0
                         $inst.Estado = 'esperando'
                     } catch {
                         Publicar -Inst $inst -Res ([pscustomobject]@{
@@ -214,10 +226,25 @@ function Invoke-ACConsultaMasiva {
                             $resuelto = $true
                         }
                     }
+
+                    # Reenviar BUSCAR: con varias instancias el clic se pierde
+                    # si otra roba el primer plano antes de que AC lo procese.
+                    # Sin esto el numero terminaba como falso "NO ENCONTRADO".
+                    if (-not $resuelto -and
+                        ((Get-Date) - $inst.UltBuscar).TotalSeconds -gt 7 -and
+                        $inst.Reenvios -lt $MaxReenvios) {
+
+                        $inst.Reenvios++
+                        if ($Trace) { Write-Host ("    [traza inst {0}] reenviando BUSCAR (intento {1})" -f $inst.Indice, $inst.Reenvios) -ForegroundColor DarkGray }
+                        [void](Invoke-ACClicActivado -Fijos $inst.Fijos -Control $inst.Fijos.Buscar.Handle -Cebo $inst.Fijos.Radio.Handle)
+                        $inst.UltBuscar = Get-Date
+                    }
+
                     if (-not $resuelto -and $transcurrido -gt $TimeoutPorNumeroSeg) {
                         Publicar -Inst $inst -Res ([pscustomobject]@{
                             Numero = $inst.Numero; Encontrado = $false
-                            Mensaje = "AC no respondio en $TimeoutPorNumeroSeg s."; Filas = @()
+                            Mensaje = "AC no respondio tras $($inst.Reenvios) reenvios en $TimeoutPorNumeroSeg s."
+                            Filas = @()
                         })
                     }
                 }
@@ -299,3 +326,4 @@ function Invoke-ACConsultaMasiva {
         InstanciasVivas   = $vivas
     }
 }
+
