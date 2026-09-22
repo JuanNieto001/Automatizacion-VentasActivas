@@ -140,8 +140,19 @@ function Invoke-ACConsultaMasiva {
         [int]$ReciclarCada = 150,
         [int]$MaxRevivir = 3,
         # Sondeos seguidos sin respuesta antes de dar la instancia por colgada.
-        # A 250 ms por vuelta y 2 s de plazo por sondeo, 5 son ~10 s de silencio.
-        [int]$MaxSondeosMudos = 5,
+        # Cada sondeo cuesta hasta 2 s de plazo mas la vuelta del bucle, asi que
+        # 40 son ~90 s de silencio continuo.
+        #
+        # Tiene que ser MUY tolerante. AC es VB6: bloquea su propia ventana
+        # mientras espera a Oracle, de modo que una consulta lenta es
+        # indistinguible de un cuelgue mirando solo si contesta. Con el umbral
+        # en 5 (~10 s) y AC respondiendo a 20-40 s por consulta -como el 22-sep
+        # por la tarde- se reiniciaban instancias sanas una y otra vez
+        # ("reciclando tras 1 consultas") y la corrida avanzaba menos que sin
+        # la proteccion. Lo que evita el desplome no es matar la instancia sino
+        # que el sondeo tenga plazo: el bucle sigue girando y atiende a las
+        # demas. Matarla es solo el ultimo recurso para un cuelgue de verdad.
+        [int]$MaxSondeosMudos = 40,
         [switch]$Trace
     )
 
