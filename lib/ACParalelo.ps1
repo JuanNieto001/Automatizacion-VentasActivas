@@ -101,6 +101,7 @@ function Start-ACInstancias {
                 Carga    = 0
                 T0Leyendo= [datetime]::MinValue
                 Ctrls    = $null
+                Mudo     = 0
             })
             Write-Paso "Instancia $i de $Cantidad lista (PID $($ctx.ProcessId))" "OK"
         } catch {
@@ -138,6 +139,9 @@ function Invoke-ACConsultaMasiva {
         # preventivo mas abajo.
         [int]$ReciclarCada = 150,
         [int]$MaxRevivir = 3,
+        # Sondeos seguidos sin respuesta antes de dar la instancia por colgada.
+        # A 250 ms por vuelta y 2 s de plazo por sondeo, 5 son ~10 s de silencio.
+        [int]$MaxSondeosMudos = 5,
         [switch]$Trace
     )
 
@@ -167,6 +171,7 @@ function Invoke-ACConsultaMasiva {
         # la ventana de resultados ya se cerro: sus handles no sirven para el
         # siguiente numero
         $Inst.Ctrls    = $null
+        $Inst.Mudo     = 0
     }
 
     while ($cola.Count -gt 0 -or ($Instancias | Where-Object { $_.Estado -ne 'libre' })) {
@@ -340,6 +345,27 @@ function Invoke-ACConsultaMasiva {
                     if ($tv -and $lv) {
                         # sondeo barato: un solo mensaje, sin memoria remota
                         $filas = Get-ListViewRowCount -Hwnd $lv.Handle
+
+                        # -1 = la ventana no contesto dentro del plazo. Se le dan
+                        # unos cuantos ciclos de gracia (AC se queda mudo un
+                        # momento mientras Oracle le responde) pero no mas: una
+                        # instancia colgada frena a todas las demas, y no vale la
+                        # pena esperarla cuando reiniciarla cuesta ~20 s.
+                        if ($filas -eq -1) {
+                            $inst.Mudo = $inst.Mudo + 1
+                            if ($inst.Mudo -ge $MaxSondeosMudos) {
+                                Write-Paso ("Instancia $($inst.Indice): no responde hace {0} sondeos, se reinicia" -f $inst.Mudo) "WARN"
+                                Publicar -Inst $inst -Res ([pscustomobject]@{
+                                    Numero = $inst.Numero; Encontrado = $false
+                                    Mensaje = "La instancia de AC dejo de responder."; Filas = @()
+                                })
+                                $inst.Mudo = 0
+                                # forzar el reciclado en la proxima vuelta
+                                $inst.Carga = [Math]::Max($inst.Carga, $ReciclarCada)
+                            }
+                            continue
+                        }
+                        $inst.Mudo = 0
                         if ($Trace) {
                             Write-Host ("    [traza inst {0}] t={1:N1}s filas={2} clics={3}" -f `
                                 $inst.Indice, $transcurrido, $filas, $inst.Intentos) -ForegroundColor DarkGray
@@ -357,6 +383,7 @@ function Invoke-ACConsultaMasiva {
                             # el nodo ya existe: si se hace antes, AC ignora el
                             # clic y se pierde mas de un segundo por consulta.
                             $nodos = Get-TreeViewCount -Hwnd $tv.Handle
+                            if ($nodos -eq -1) { $inst.Mudo = $inst.Mudo + 1; continue }
                             if (((Get-Date) - $inst.UltClic).TotalMilliseconds -gt 800) {
                                 if ($nodos -gt 0) {
                                     [void](Invoke-ACClicActivado -Fijos $inst.Fijos -Control $tv.Handle -X 60 -Y 10)

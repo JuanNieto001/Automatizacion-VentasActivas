@@ -31,10 +31,19 @@ public class RP {
     [DllImport("user32.dll")]
     public static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")]
+    public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam,
+                                                   uint flags, uint timeout, out IntPtr result);
+    [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
 }
 "@
 }
+
+# SendMessage se queda bloqueado para siempre si la ventana destino dejo de
+# atender su cola de mensajes. Con varias instancias eso es fatal: el bucle es
+# de un solo hilo, asi que una instancia colgada congela a todas las demas.
+$script:SMTO_ABORTIFHUNG = 0x0002
+$script:SONDEO_MS        = 2000
 
 $script:PROC_ACCESS  = 0x0008 -bor 0x0010 -bor 0x0020 -bor 0x0400   # VM_OPERATION|VM_READ|VM_WRITE|QUERY_INFO
 $script:MEM_RESERVE  = 0x1000 -bor 0x2000
@@ -80,21 +89,57 @@ function Read-RemoteString {
     return $s.Trim()
 }
 
+function Send-MensajeConPlazo {
+    <#  Como SendMessage pero sin poder colgarse: si la ventana no contesta en
+        el plazo, devuelve -1 en vez de esperar indefinidamente.
+
+        Es lo que hace la diferencia entre "una instancia de AC se atasco" y
+        "se atasco la corrida entera": el bucle de Invoke-ACConsultaMasiva es de
+        un solo hilo y atiende a las instancias por turnos, de modo que un
+        SendMessage bloqueado en una de ellas deja a las otras sin atencion, sus
+        numeros vencen por tiempo y la corrida se desploma. Visto el 22-sep en
+        la corrida de julio: los tiempos pasaron de 10 s a mas de 300 s por
+        numero con un plazo configurado de 75 s, justo porque el vencimiento
+        tampoco alcanzaba a evaluarse.  #>
+    param(
+        [Parameter(Mandatory=$true)][IntPtr]$Hwnd,
+        [Parameter(Mandatory=$true)][uint32]$Mensaje,
+        [IntPtr]$WParam = [IntPtr]::Zero,
+        [IntPtr]$LParam = [IntPtr]::Zero,
+        [int]$PlazoMs = 0
+    )
+    if ($PlazoMs -le 0) { $PlazoMs = $script:SONDEO_MS }
+    $res = [IntPtr]::Zero
+    $ok = [RP]::SendMessageTimeout($Hwnd, $Mensaje, $WParam, $LParam,
+                                   $script:SMTO_ABORTIFHUNG, [uint32]$PlazoMs, [ref]$res)
+    if ($ok -eq [IntPtr]::Zero) { return -1 }
+    return [int]$res
+}
+
 function Get-ListViewRowCount {
     <#  Cuenta las filas con UN solo mensaje y sin reservar memoria remota.
+        Devuelve -1 si la ventana no contesta dentro del plazo.
 
         Es lo que se usa para sondear: llamar a Get-ListViewData en cada ciclo
         satura el bucle de mensajes de AC (decenas de SendMessage sincronos por
         segundo mas VirtualAllocEx) y llega a impedir que procese los clics que
         se le envian.  #>
-    param([Parameter(Mandatory=$true)][IntPtr]$Hwnd)
-    return [int][RP]::SendMessage($Hwnd, $script:LVM_GETITEMCOUNT, [IntPtr]::Zero, [IntPtr]::Zero)
+    param([Parameter(Mandatory=$true)][IntPtr]$Hwnd, [int]$PlazoMs = 0)
+    return Send-MensajeConPlazo -Hwnd $Hwnd -Mensaje $script:LVM_GETITEMCOUNT -PlazoMs $PlazoMs
 }
 
 function Get-TreeViewCount {
-    <#  Numero de nodos del arbol con un solo mensaje (TVM_GETCOUNT).  #>
-    param([Parameter(Mandatory=$true)][IntPtr]$Hwnd)
-    return [int][RP]::SendMessage($Hwnd, 0x1105, [IntPtr]::Zero, [IntPtr]::Zero)
+    <#  Numero de nodos del arbol con un solo mensaje (TVM_GETCOUNT).
+        Devuelve -1 si la ventana no contesta dentro del plazo.  #>
+    param([Parameter(Mandatory=$true)][IntPtr]$Hwnd, [int]$PlazoMs = 0)
+    return Send-MensajeConPlazo -Hwnd $Hwnd -Mensaje 0x1105 -PlazoMs $PlazoMs
+}
+
+function Test-VentanaResponde {
+    <#  Sondeo barato para saber si una ventana sigue atendiendo mensajes.  #>
+    param([Parameter(Mandatory=$true)][IntPtr]$Hwnd, [int]$PlazoMs = 0)
+    # WM_NULL: no hace nada, solo comprueba que la cola se atiende
+    return (Send-MensajeConPlazo -Hwnd $Hwnd -Mensaje 0x0000 -PlazoMs $PlazoMs) -ne -1
 }
 
 function Get-ListViewColumns {
