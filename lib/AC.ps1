@@ -385,8 +385,25 @@ function Invoke-ACBusqueda {
     # El numero se escribe con WM_SETTEXT: no depende del foco del teclado,
     # que en AC se desvia a un PictureBox al hacer clic en el panel.
     if (-not $ctx.EditCriterio) { throw "No se encontro el campo Criterio." }
-    $leido = Set-CtrlText -Handle $ctx.EditCriterio.Handle -Text $Numero
-    if ($leido -ne $Numero) { throw "No se pudo escribir el numero en el campo Criterio (quedo '$leido')." }
+
+    # AC deja el numero de la busqueda anterior en el campo, y a veces lo repone
+    # despues de escribir: si se da por buena la primera escritura se termina
+    # consultando el numero equivocado, o falla con "quedo '<otro numero>'".
+    # Se vacia primero y se reintenta verificando lo que quedo.
+    $leido = ''
+    for ($intento = 1; $intento -le 4; $intento++) {
+        [void](Set-CtrlText -Handle $ctx.EditCriterio.Handle -Text '')
+        Start-Sleep -Milliseconds 80
+        $leido = Set-CtrlText -Handle $ctx.EditCriterio.Handle -Text $Numero
+        if ($leido -eq $Numero) {
+            # releer tras una pausa: si AC lo repone, aqui se nota
+            Start-Sleep -Milliseconds 150
+            $leido = Get-CtrlText -Handle $ctx.EditCriterio.Handle
+            if ("$leido".Trim() -eq $Numero) { break }
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    if ("$leido".Trim() -ne $Numero) { throw "No se pudo escribir el numero en el campo Criterio (quedo '$leido')." }
 
     Invoke-PostClick -Handle $ctx.BotonBuscar.Handle -SettleMs 150
 
@@ -604,5 +621,86 @@ function Get-ACHistorial {
         Cabecera        = $textos
         EstadoContrato  = $estado
         Dispositivos    = $disp
+    }
+}
+
+function Get-ACIndicadoresCobranza {
+    <#  Lee las casillas de cobranza de la ficha abierta.
+
+        "En Demanda" y "Castigada" son las que importan para una linea
+        suspendida: dicen si la deuda ya paso a cobro juridico o si el operador
+        la dio por perdida. En esos casos la venta no se recupera contactando
+        al cliente.  #>
+    $ctx = Get-ACContext
+    if (-not $ctx.Ficha) { throw "No hay ficha de cliente abierta." }
+
+    $BM_GETCHECK = 0x00F0
+    $k = Get-ChildHandles -Parent $ctx.Ficha.Handle
+    $r = [ordered]@{}
+    foreach ($n in @('Respon. Pago', 'Flag No Cobrar', 'En Demanda', 'Castigada')) {
+        $cb = $k | Where-Object { $_.Class -like '*CheckBox*' -and "$($_.Text)".Trim() -eq $n } | Select-Object -First 1
+        $r[$n] = if ($cb) {
+            if ([int][W32]::SendMessage($cb.Handle, $BM_GETCHECK, [IntPtr]::Zero, [IntPtr]::Zero) -eq 1) { 'SI' } else { 'NO' }
+        } else { '' }
+    }
+    return [pscustomobject]$r
+}
+
+function Get-ACSaldo {
+    <#  Pulsa el boton "Saldo" de la ficha abierta y lee lo que debe la linea.
+
+        La ventana trae tres importes, en este orden de arriba a abajo:
+        Saldo Equipo, Saldo Servicios y Saldo Total. Las etiquetas son labels
+        de VB6 -no son ventanas reales y no se pueden leer por mensaje- asi que
+        los campos se identifican por su posicion vertical, que es fija.
+
+        Solo lectura: abrir el saldo no modifica nada.  #>
+    param([int]$TimeoutSeg = 30)
+
+    $ctx = Get-ACContext
+    if (-not $ctx.Ficha) { throw "No hay ficha de cliente abierta." }
+
+    $k = Get-ChildHandles -Parent $ctx.Ficha.Handle
+    $btn = $k | Where-Object { $_.Class -like '*CommandButton*' -and "$($_.Text)".Trim() -eq 'Saldo' } |
+           Select-Object -First 1
+    if (-not $btn) { throw "La ficha no tiene boton 'Saldo' (perfil sin acceso?)." }
+
+    $antes = @(Get-ChildHandles -Parent $ctx.MDIClient.Handle | ForEach-Object { $_.Handle })
+    # Como Consultar, este boton exige el raton real
+    Invoke-ClickControl -Handle $btn.Handle -SettleMs 500
+
+    $vent = Wait-Condition -TimeoutSeg $TimeoutSeg -IntervaloMs 300 -Condicion {
+        $v = @(Get-ChildHandles -Parent $ctx.MDIClient.Handle |
+               Where-Object { $antes -notcontains $_.Handle -and $_.Visible }) | Select-Object -First 1
+        if (-not $v) {
+            $v = @(Get-TopWindows -ProcessId $ctx.ProcessId |
+                   Where-Object { $_.Handle -ne $ctx.Principal.Handle -and $_.Visible -and $_.Class -eq 'ThunderRT6FormDC' }) |
+                 Select-Object -First 1
+        }
+        if (-not $v) { return $null }
+        $tb = @(Get-ChildHandles -Parent $v.Handle | Where-Object { $_.Class -like '*TextBox*' -and $_.Visible })
+        if ($tb.Count -ge 3) { return @{ Vent = $v; Campos = $tb } }
+    }
+    if (-not $vent) { throw "No aparecio la ventana de saldo." }
+
+    $orden = @($vent.Campos | Sort-Object Y)
+    function Num { param($s)
+        $t = "$s" -replace '[^\d,.\-]', ''
+        $t = $t -replace ',', ''
+        $d = 0.0
+        if ([double]::TryParse($t, [ref]$d)) { return $d }
+        return $null
+    }
+    $eq = Get-CtrlText -Handle $orden[0].Handle
+    $sv = Get-CtrlText -Handle $orden[1].Handle
+    $to = Get-CtrlText -Handle $orden[2].Handle
+
+    return [pscustomobject]@{
+        SaldoEquipo    = "$eq".Trim()
+        SaldoServicios = "$sv".Trim()
+        SaldoTotal     = "$to".Trim()
+        EquipoNum      = Num $eq
+        ServiciosNum   = Num $sv
+        TotalNum       = Num $to
     }
 }
