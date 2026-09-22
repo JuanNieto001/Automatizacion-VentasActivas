@@ -45,7 +45,17 @@ param(
     [int]      $MaxReintentos = 2,
     # Segundos de espera cuando AC abre la ventana de resultados pero no trae
     # ninguna linea. 0 = esperar el plazo completo (mas lento, para repasar).
+    #
+    # Ojo al bajarlo cuando AC va lento: el 22-sep, con AC respondiendo a 20-40 s
+    # por consulta, un plazo de 45 s hizo que el "no encontrado" pasara del 1,7%
+    # al 13,2%. No eran lineas inexistentes, era el plazo quedandose corto.
     [int]      $TimeoutVacioSeg = 45,
+    # Plazo total por numero antes de darlo por perdido.
+    [int]      $TimeoutPorNumeroSeg = 75,
+    # Busquedas antes de reiniciar preventivamente una instancia. Subirlo cuando
+    # AC este lento: alli cada arranque cuesta minutos y el reinicio deja de
+    # compensar. 0 lo desactiva.
+    [int]      $ReciclarCada = 150,
     # La portabilidad tarda dias habiles en quedar aprovisionada: una venta de
     # ayer aparece como desactivada o ni siquiera existe, y su historial no
     # dice nada util. Con esto la pasada 2 se salta las ventas mas nuevas que
@@ -309,6 +319,7 @@ $porNumero = @{}
 
 $stats = Invoke-ACConsultaMasiva -Numeros $listaNumeros -Instancias $pool `
             -Password $clave -BaseDatos $BaseDatos -TimeoutVacioSeg $TimeoutVacioSeg `
+            -TimeoutPorNumeroSeg $TimeoutPorNumeroSeg -ReciclarCada $ReciclarCada `
             -LatenciaMaxSeg $LatenciaMaxSeg -PausaSeg $PausaSeg -MaxPausas $MaxPausas -OnResultado {
     param($r)
     $script:hechos++
@@ -348,8 +359,9 @@ $stats = Invoke-ACConsultaMasiva -Numeros $listaNumeros -Instancias $pool `
         $script:hechos, $script:total, $r.Numero, $txt, $r.Segundos, $r.Instancia) -ForegroundColor $col
 
     # Guardado parcial: en una corrida larga no se puede perder todo por un
-    # fallo al final. Se reescribe el CSV cada 50 numeros.
-    if (($script:hechos % 50) -eq 0) {
+    # fallo al final. Con AC lento cada numero cuesta casi un minuto, asi que
+    # se guarda seguido: perder 20 numeros son 20 minutos de trabajo.
+    if (($script:hechos % 20) -eq 0) {
         try { $script:resultados | Export-Csv -LiteralPath $script:Salida -NoTypeInformation -Encoding UTF8 } catch { }
         Write-Host ("       ... parcial guardado ({0} numeros)" -f $script:hechos) -ForegroundColor DarkGray
     }

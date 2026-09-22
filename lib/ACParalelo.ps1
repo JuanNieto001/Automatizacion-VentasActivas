@@ -83,6 +83,7 @@ function Start-ACInstancias {
     $inst = New-Object System.Collections.ArrayList
 
     for ($i = 1; $i -le $Cantidad; $i++) {
+        $antes = @(Get-ACProcesses | ForEach-Object { $_.Id })
         try {
             $ctx = Start-ACInstancia -Password $Password -BaseDatos $BaseDatos -Silencioso
             $fijos = Get-ACControlesFijos -ProcessId $ctx.ProcessId
@@ -101,11 +102,19 @@ function Start-ACInstancias {
                 Carga    = 0
                 T0Leyendo= [datetime]::MinValue
                 Ctrls    = $null
-                Mudo     = 0
+                T0Mudo   = [datetime]::MinValue
             })
             Write-Paso "Instancia $i de $Cantidad lista (PID $($ctx.ProcessId))" "OK"
         } catch {
             Write-Paso "No se pudo levantar la instancia ${i}: $($_.Exception.Message)" "ERROR"
+            # Un arranque fallido deja el proceso de AC vivo y cargando: si no
+            # se cierra, sigue compitiendo por la base con las instancias que si
+            # sirven y hace todavia mas lentos los arranques siguientes.
+            foreach ($p in (Get-ACProcesses)) {
+                if ($antes -notcontains $p.Id) {
+                    try { $p.Kill(); Write-Paso "  se cierra el AC huerfano (PID $($p.Id))" "WARN" } catch { }
+                }
+            }
         }
     }
 
@@ -139,20 +148,13 @@ function Invoke-ACConsultaMasiva {
         # preventivo mas abajo.
         [int]$ReciclarCada = 150,
         [int]$MaxRevivir = 3,
-        # Sondeos seguidos sin respuesta antes de dar la instancia por colgada.
-        # Cada sondeo cuesta hasta 2 s de plazo mas la vuelta del bucle, asi que
-        # 40 son ~90 s de silencio continuo.
-        #
-        # Tiene que ser MUY tolerante. AC es VB6: bloquea su propia ventana
-        # mientras espera a Oracle, de modo que una consulta lenta es
-        # indistinguible de un cuelgue mirando solo si contesta. Con el umbral
-        # en 5 (~10 s) y AC respondiendo a 20-40 s por consulta -como el 22-sep
-        # por la tarde- se reiniciaban instancias sanas una y otra vez
-        # ("reciclando tras 1 consultas") y la corrida avanzaba menos que sin
-        # la proteccion. Lo que evita el desplome no es matar la instancia sino
-        # que el sondeo tenga plazo: el bucle sigue girando y atiende a las
-        # demas. Matarla es solo el ultimo recurso para un cuelgue de verdad.
-        [int]$MaxSondeosMudos = 40,
+        # Una instancia se da por colgada cuando lleva mas de
+        # TimeoutPorNumeroSeg + 60 s sin contestar un solo sondeo. El umbral va
+        # POR ENCIMA del plazo normal del numero a proposito: AC es VB6 y
+        # congela su ventana mientras espera a Oracle, asi que desde afuera una
+        # consulta lenta y un cuelgue se ven igual. Si el umbral fuera menor,
+        # se matarian consultas buenas y sus numeros saldrian como NO
+        # ENCONTRADO falsos, que es lo que paso el 22-sep.
         # --- Freno cuando AC se pone lento ---------------------------------
         # Si la latencia media reciente pasa de LatenciaMaxSeg, se para un rato
         # para no seguir cargando a AC. Es adaptativo a proposito: un descanso
@@ -194,7 +196,7 @@ function Invoke-ACConsultaMasiva {
         # la ventana de resultados ya se cerro: sus handles no sirven para el
         # siguiente numero
         $Inst.Ctrls    = $null
-        $Inst.Mudo     = 0
+        $Inst.T0Mudo   = [datetime]::MinValue
     }
 
     while ($cola.Count -gt 0 -or ($Instancias | Where-Object { $_.Estado -ne 'libre' })) {
@@ -375,20 +377,45 @@ function Invoke-ACConsultaMasiva {
                         # instancia colgada frena a todas las demas, y no vale la
                         # pena esperarla cuando reiniciarla cuesta ~20 s.
                         if ($filas -eq -1) {
-                            $inst.Mudo = $inst.Mudo + 1
-                            if ($inst.Mudo -ge $MaxSondeosMudos) {
-                                Write-Paso ("Instancia $($inst.Indice): no responde hace {0} sondeos, se reinicia" -f $inst.Mudo) "WARN"
+                            # Se mide en TIEMPO, no en numero de sondeos, y el
+                            # umbral va por encima del plazo normal del numero.
+                            # Si saltara antes, mataria consultas que solo van
+                            # lentas: AC congela su ventana mientras consulta,
+                            # asi que "no contesta" y "esta trabajando" se ven
+                            # igual desde afuera. El 22-sep, con el umbral en
+                            # ~90 s y el plazo por numero en 180 s, cada mudez
+                            # se llevaba por delante un numero bueno y lo
+                            # publicaba como NO ENCONTRADO.
+                            if ($inst.T0Mudo -eq [datetime]::MinValue) { $inst.T0Mudo = Get-Date }
+                            $mudoSeg = ((Get-Date) - $inst.T0Mudo).TotalSeconds
+                            if ($mudoSeg -gt ($TimeoutPorNumeroSeg + 60)) {
+                                Write-Paso ("Instancia $($inst.Indice): sin responder hace {0:N0} s, se reinicia" -f $mudoSeg) "WARN"
                                 Publicar -Inst $inst -Res ([pscustomobject]@{
                                     Numero = $inst.Numero; Encontrado = $false
                                     Mensaje = "La instancia de AC dejo de responder."; Filas = @()
                                 })
-                                $inst.Mudo = 0
-                                # forzar el reciclado en la proxima vuelta
-                                $inst.Carga = [Math]::Max($inst.Carga, $ReciclarCada)
+                                $inst.T0Mudo = [datetime]::MinValue
+                                # Reinicio real, sin depender de ReciclarCada:
+                                # con ReciclarCada 0 la instancia quedaba muda
+                                # para siempre, quemando un numero cada vez.
+                                if ($Password) {
+                                    try { (Get-Process -Id $inst.Fijos.ProcessId -ErrorAction SilentlyContinue).Kill() } catch { }
+                                    Start-Sleep -Seconds 2
+                                    try {
+                                        $ctxN = Start-ACInstancia -Password $Password -BaseDatos $BaseDatos -Silencioso
+                                        $fj = Get-ACControlesFijos -ProcessId $ctxN.ProcessId
+                                        if (-not $fj) { throw "sin panel de criterios" }
+                                        $inst.Fijos = $fj; $inst.Carga = 0; $inst.Consultas = 0
+                                        $inst.Ctrls = $null
+                                    } catch {
+                                        Write-Paso "Instancia $($inst.Indice): no se pudo reiniciar ($($_.Exception.Message))" "WARN"
+                                        $inst.Estado = 'muerta'
+                                    }
+                                }
                             }
                             continue
                         }
-                        $inst.Mudo = 0
+                        $inst.T0Mudo = [datetime]::MinValue
                         if ($Trace) {
                             Write-Host ("    [traza inst {0}] t={1:N1}s filas={2} clics={3}" -f `
                                 $inst.Indice, $transcurrido, $filas, $inst.Intentos) -ForegroundColor DarkGray
@@ -406,7 +433,7 @@ function Invoke-ACConsultaMasiva {
                             # el nodo ya existe: si se hace antes, AC ignora el
                             # clic y se pierde mas de un segundo por consulta.
                             $nodos = Get-TreeViewCount -Hwnd $tv.Handle
-                            if ($nodos -eq -1) { $inst.Mudo = $inst.Mudo + 1; continue }
+                            if ($nodos -eq -1) { continue }
                             if (((Get-Date) - $inst.UltClic).TotalMilliseconds -gt 800) {
                                 if ($nodos -gt 0) {
                                     [void](Invoke-ACClicActivado -Fijos $inst.Fijos -Control $tv.Handle -X 60 -Y 10)
@@ -479,7 +506,7 @@ function Invoke-ACConsultaMasiva {
                         $fj = Get-ACControlesFijos -ProcessId $ctxN.ProcessId
                         if (-not $fj) { throw "sin panel de criterios" }
                         $inst.Fijos = $fj; $inst.Carga = 0; $inst.Consultas = 0
-                        $inst.Numero = $null; $inst.Intentos = 0; $inst.Mudo = 0
+                        $inst.Numero = $null; $inst.Intentos = 0; $inst.T0Mudo = [datetime]::MinValue
                         $inst.Ctrls = $null; $inst.Estado = 'libre'
                         $revividas++
                     } catch {
@@ -549,5 +576,6 @@ function Invoke-ACConsultaMasiva {
         Pendientes        = @($cola.ToArray())
     }
 }
+
 
 

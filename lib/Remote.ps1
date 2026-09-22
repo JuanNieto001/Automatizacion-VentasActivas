@@ -42,8 +42,19 @@ public class RP {
 # SendMessage se queda bloqueado para siempre si la ventana destino dejo de
 # atender su cola de mensajes. Con varias instancias eso es fatal: el bucle es
 # de un solo hilo, asi que una instancia colgada congela a todas las demas.
-$script:SMTO_ABORTIFHUNG = 0x0002
-$script:SONDEO_MS        = 2000
+#
+# OJO con SMTO_ABORTIFHUNG (0x0002): NO se usa a proposito. Windows da por
+# "colgada" a toda ventana que lleve unos 5 s sin atender su cola, y AC es VB6:
+# congela su propia ventana durante cada consulta a Oracle. Con esa bandera el
+# sondeo devolvia error mientras AC estaba trabajando normalmente, se contaban
+# esas respuestas como instancia muda, se la mataba a media consulta y el
+# numero salia como "NO ENCONTRADO" siendo falso. Paso el 22-sep: el 6% de una
+# tanda salio mal por esto. SMTO_NORMAL espera el plazo completo, que es lo
+# correcto: lo que se quiere es no bloquearse para siempre, no rendirse pronto.
+$script:SMTO_NORMAL = 0x0000
+# Holgado a proposito: AC tarda en contestar mientras consulta, y un plazo
+# corto solo produce falsos negativos.
+$script:SONDEO_MS   = 5000
 
 $script:PROC_ACCESS  = 0x0008 -bor 0x0010 -bor 0x0020 -bor 0x0400   # VM_OPERATION|VM_READ|VM_WRITE|QUERY_INFO
 $script:MEM_RESERVE  = 0x1000 -bor 0x2000
@@ -111,7 +122,7 @@ function Send-MensajeConPlazo {
     if ($PlazoMs -le 0) { $PlazoMs = $script:SONDEO_MS }
     $res = [IntPtr]::Zero
     $ok = [RP]::SendMessageTimeout($Hwnd, $Mensaje, $WParam, $LParam,
-                                   $script:SMTO_ABORTIFHUNG, [uint32]$PlazoMs, [ref]$res)
+                                   $script:SMTO_NORMAL, [uint32]$PlazoMs, [ref]$res)
     if ($ok -eq [IntPtr]::Zero) { return -1 }
     return [int]$res
 }
