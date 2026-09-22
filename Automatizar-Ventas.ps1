@@ -52,6 +52,15 @@ param(
     # N dias. 0 = no saltarse ninguna.
     [int]      $DiasMinimos = 0,
     [string]   $ColumnaFecha = 'B',
+    # Retoma una corrida cortada: lee los CSV indicados (o el propio -Salida si
+    # ya existe) y se salta los numeros que ya tengan resultado.
+    [switch]   $Reanudar,
+    [string[]] $ResultadosPrevios,
+    # Freno adaptativo: si AC se pone mas lento que esto, se pausa para no
+    # seguir cargandolo. 0 lo desactiva.
+    [int]      $LatenciaMaxSeg = 25,
+    [int]      $PausaSeg = 120,
+    [int]      $MaxPausas = 4,
     [ValidateRange(1, 12)]
     [int]      $Instancias = 1
 )
@@ -188,6 +197,49 @@ if ($Numeros -and $Numeros.Count -gt 0) {
 
 if ($listaNumeros.Count -eq 0) { throw "No hay numeros que verificar." }
 
+# ---------------------------------------------------------------------
+#  Reanudar: descartar lo que ya se consulto en una corrida anterior
+# ---------------------------------------------------------------------
+
+$yaHechos  = @{}
+$previos   = New-Object System.Collections.ArrayList
+if ($Reanudar -or $ResultadosPrevios) {
+    $fuentes = @()
+    if ($ResultadosPrevios) { $fuentes += $ResultadosPrevios }
+    # -Salida todavia no tiene su valor por defecto en este punto; solo se usa
+    # si quien llama la indico explicitamente.
+    if ($Reanudar -and $Salida -and (Test-Path -LiteralPath $Salida)) { $fuentes += $Salida }
+    if ($fuentes.Count -eq 0) {
+        Write-Host "-Reanudar sin CSV previo que leer: se consultan todos los numeros." -ForegroundColor Yellow
+    }
+    foreach ($ruta in ($fuentes | Sort-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $ruta)) {
+            Write-Host "No existe el CSV de resultados previos: $ruta" -ForegroundColor Yellow
+            continue
+        }
+        $n = 0
+        foreach ($r in (Import-Csv -LiteralPath $ruta -Encoding UTF8)) {
+            # Un ERROR anterior no cuenta como hecho: se vuelve a intentar.
+            if (-not $r.NUMERO) { continue }
+            if ($r.ENCONTRADO -ne 'SI' -and $r.ENCONTRADO -ne 'NO') { continue }
+            $yaHechos[$r.NUMERO] = $r
+            $n++
+        }
+        Write-Host ("Resultados previos: {0} numeros desde {1}" -f $n, (Split-Path -Leaf $ruta))
+    }
+    if ($yaHechos.Count -gt 0) {
+        $antes = $listaNumeros.Count
+        $listaNumeros = @($listaNumeros | Where-Object { -not $yaHechos.ContainsKey($_) })
+        Write-Host ("Se omiten {0} ya verificados; quedan {1} por consultar." -f `
+                    ($antes - $listaNumeros.Count), $listaNumeros.Count) -ForegroundColor Cyan
+        # los previos se arrastran al reporte final para que salga completo
+        foreach ($r in $yaHechos.Values) { [void]$previos.Add($r) }
+    }
+    if ($listaNumeros.Count -eq 0) {
+        Write-Host "No queda nada por consultar: todos los numeros ya tienen resultado." -ForegroundColor Green
+    }
+}
+
 $totalDisponibles = $listaNumeros.Count
 if ($Limite -gt 0 -and $listaNumeros.Count -gt $Limite) {
     $listaNumeros = @($listaNumeros | Select-Object -First $Limite)
@@ -206,6 +258,10 @@ $clave = Get-Clave -Explicita $Password
 # ---------------------------------------------------------------------
 
 $resultados = New-Object System.Collections.ArrayList
+# Al reanudar, lo ya verificado entra de una para que el CSV y el Excel finales
+# salgan completos y no solo con el trozo nuevo.
+foreach ($r in $previos) { [void]$resultados.Add($r) }
+if ($previos.Count) { Write-Host ("Se arrastran {0} resultados de la corrida anterior." -f $previos.Count) -ForegroundColor Gray }
 $sello = Get-Date -Format 'yyyyMMdd_HHmmss'
 if (-not $Salida) { $Salida = Join-Path $dirSalida "ventas_$sello.csv" }
 $dirCapturas = Join-Path $dirSalida "capturas_$sello"
@@ -252,7 +308,8 @@ $total  = $listaNumeros.Count
 $porNumero = @{}
 
 $stats = Invoke-ACConsultaMasiva -Numeros $listaNumeros -Instancias $pool `
-            -Password $clave -BaseDatos $BaseDatos -TimeoutVacioSeg $TimeoutVacioSeg -OnResultado {
+            -Password $clave -BaseDatos $BaseDatos -TimeoutVacioSeg $TimeoutVacioSeg `
+            -LatenciaMaxSeg $LatenciaMaxSeg -PausaSeg $PausaSeg -MaxPausas $MaxPausas -OnResultado {
     param($r)
     $script:hechos++
     $reg = New-Registro -Numero $r.Numero

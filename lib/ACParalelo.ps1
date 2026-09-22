@@ -153,6 +153,16 @@ function Invoke-ACConsultaMasiva {
         # que el sondeo tenga plazo: el bucle sigue girando y atiende a las
         # demas. Matarla es solo el ultimo recurso para un cuelgue de verdad.
         [int]$MaxSondeosMudos = 40,
+        # --- Freno cuando AC se pone lento ---------------------------------
+        # Si la latencia media reciente pasa de LatenciaMaxSeg, se para un rato
+        # para no seguir cargando a AC. Es adaptativo a proposito: un descanso
+        # fijo cada N consultas pierde tiempo cuando AC esta sano y se queda
+        # corto cuando no lo esta.
+        [int]$LatenciaMaxSeg = 25,
+        [int]$PausaSeg = 120,
+        [int]$MaxPausas = 4,
+        # Consultas recientes sobre las que se mide la latencia.
+        [int]$VentanaLatencia = 12,
         [switch]$Trace
     )
 
@@ -164,6 +174,8 @@ function Invoke-ACConsultaMasiva {
     $swGlobal   = [Diagnostics.Stopwatch]::StartNew()
     $rondasRevivir = 0
     $incompleto    = $false
+    $pausasHechas  = 0
+    $medidoDesde   = 0      # cuantos resultados habia cuando se midio por ultima vez
 
     function Publicar {
         param($Inst, $Res)
@@ -430,6 +442,57 @@ function Invoke-ACConsultaMasiva {
                         }
                     }
                 }
+            }
+        }
+
+        # --- freno: si AC se puso lento, dejarlo respirar -------------------
+        # Solo se evalua con todas las instancias libres, para no cortar una
+        # consulta a medias, y solo una vez por cada VentanaLatencia consultas
+        # nuevas, para no pausar dos veces seguidas por la misma medicion.
+        if ($LatenciaMaxSeg -gt 0 -and $PausaSeg -gt 0 -and $cola.Count -gt 0 -and
+            $pausasHechas -lt $MaxPausas -and
+            $resultados.Count -ge ($medidoDesde + $VentanaLatencia) -and
+            -not ($Instancias | Where-Object { $_.Estado -eq 'esperando' -or $_.Estado -eq 'leyendo' })) {
+
+            $medidoDesde = $resultados.Count
+            $ult = @($tiempos | Select-Object -Last $VentanaLatencia)
+            $media = ($ult | Measure-Object -Average).Average
+
+            if ($media -gt $LatenciaMaxSeg) {
+                $pausasHechas++
+                Write-Paso ("AC va lento ({0:N1} s por consulta, limite {1} s): pausa de {2} s [{3} de {4}]" -f `
+                            $media, $LatenciaMaxSeg, $PausaSeg, $pausasHechas, $MaxPausas) "WARN"
+                # Se cierran las instancias durante el descanso: mantenerlas
+                # abiertas deja sesiones tomadas del lado del servidor, que es
+                # justo lo que se quiere soltar.
+                foreach ($inst in $Instancias) {
+                    if ($inst.Estado -eq 'muerta') { continue }
+                    try { (Get-Process -Id $inst.Fijos.ProcessId -ErrorAction SilentlyContinue).Kill() } catch { }
+                    $inst.Estado = 'muerta'
+                }
+                Start-Sleep -Seconds $PausaSeg
+
+                $revividas = 0
+                foreach ($inst in $Instancias) {
+                    try {
+                        $ctxN = Start-ACInstancia -Password $Password -BaseDatos $BaseDatos -Silencioso
+                        $fj = Get-ACControlesFijos -ProcessId $ctxN.ProcessId
+                        if (-not $fj) { throw "sin panel de criterios" }
+                        $inst.Fijos = $fj; $inst.Carga = 0; $inst.Consultas = 0
+                        $inst.Numero = $null; $inst.Intentos = 0; $inst.Mudo = 0
+                        $inst.Ctrls = $null; $inst.Estado = 'libre'
+                        $revividas++
+                    } catch {
+                        Write-Paso "Instancia $($inst.Indice): no se pudo reabrir tras la pausa ($($_.Exception.Message))" "WARN"
+                    }
+                }
+                if ($revividas -eq 0) {
+                    $incompleto = $true
+                    Write-Paso ("AC no dejo reabrir ninguna instancia tras la pausa; se devuelven los {0} de {1} resueltos." -f `
+                                $resultados.Count, $Numeros.Count) "ERROR"
+                    break
+                }
+                Write-Paso "Se reanuda con $revividas instancia(s)" "OK"
             }
         }
 
