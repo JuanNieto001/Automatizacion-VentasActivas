@@ -71,7 +71,11 @@ param(
     [int]      $LatenciaMaxSeg = 25,
     [int]      $PausaSeg = 120,
     [int]      $MaxPausas = 4,
-    [ValidateRange(1, 12)]
+    # AC no deja pasar de 5 sesiones por usuario: la sexta se rechaza con
+    # "Ya se estan ejecutando 5 sesiones de AC Administrador de Clientes".
+    # Medido el 22-sep sobre la misma muestra: 4 instancias dan 4,49 s por
+    # numero y 5 dan 3,54 s (16,9 numeros por minuto). Ese es el tope.
+    [ValidateRange(1, 5)]
     [int]      $Instancias = 1
 )
 
