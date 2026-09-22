@@ -210,7 +210,7 @@ function Start-ACInstancia {
     param(
         [Parameter(Mandatory=$true)][string]$Password,
         [string]$BaseDatos = "AC_PRODUCCION",
-        [int]$TimeoutSeg = 120,
+        [int]$TimeoutSeg = 300,
         [switch]$Silencioso
     )
     $exe = Get-ACExePath
@@ -225,7 +225,7 @@ function Start-ACSession {
     param(
         [Parameter(Mandatory=$true)][string]$Password,
         [string]$BaseDatos = "AC_PRODUCCION",
-        [int]$TimeoutSeg = 90
+        [int]$TimeoutSeg = 300
     )
 
     if ((Get-ACProcesses).Count -gt 0) {
@@ -244,7 +244,15 @@ function Connect-ACInstancia {
         [Parameter(Mandatory=$true)][int]$ProcessId,
         [Parameter(Mandatory=$true)][string]$Password,
         [string]$BaseDatos = "AC_PRODUCCION",
-        [int]$TimeoutSeg = 120,
+        # AC carga decenas de parametros ("Switch") contra Oracle uno por uno al
+        # arrancar. Con la base descargada tarda ~20 s, pero el 22-sep tardaba
+        # cerca de 3 minutos: con el plazo en 120 s el script se rendia justo
+        # antes de que terminara e informaba "AC no respondio al iniciar
+        # sesion", que era falso. En el log de AC se ve la sesion autenticandose
+        # y conectando bien unos segundos despues de que el script se rindio.
+        # Esperar de mas no cuesta nada: en cuanto aparece la ventana principal
+        # se sigue de largo.
+        [int]$TimeoutSeg = 300,
         [switch]$Silencioso
     )
 
@@ -329,7 +337,7 @@ function Connect-ACInstancia {
     }
 
     # dar tiempo a que cargue el perfil y el panel de criterios
-    $ctx = Wait-Condition -TimeoutSeg 90 -Condicion {
+    $ctx = Wait-Condition -TimeoutSeg ([Math]::Max(90, $TimeoutSeg)) -Condicion {
         $c = Get-ACContext -ProcessId $ProcessId
         if ($c -and $c.PanelCriterios -and $c.BotonBuscar) { $c }
     }
