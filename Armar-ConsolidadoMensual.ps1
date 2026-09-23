@@ -33,6 +33,12 @@ param(
     [string]$Hoja = 'CONSOLIDADO',
     [string]$Columna = 'E',
     [string]$ColumnaFecha = 'B',
+    # Columna con el ESTADO DIME. No todos los consolidados la traen: el de
+    # septiembre del 23-sep, por ejemplo, usa la AF para "VENTANA DE CAMBIO".
+    # Vacio = el archivo no la tiene y la comparacion con DIME se omite.
+    [string]$ColumnaDime = 'AF',
+    [string]$ColumnaAsesor = 'D',
+    [string]$ColumnaCcAsesor = 'C',
     [string]$Salida,
     [datetime]$Hoy = (Get-Date).Date
 )
@@ -72,7 +78,7 @@ for ($f = 2; $f -le $ultima; $f++) {
     $s = "$($c["$ColumnaFecha$f"])".Trim(); $x = 0
     $vta   = if ([double]::TryParse($s, [ref]$x) -and $x -gt 1000) { $base.AddDays([Math]::Floor($x)) } else { $null }
     $vence = if ($vta) { $vta.AddMonths(3) } else { $null }
-    $af    = "$($c["AF$f"])".Trim().ToUpper()
+    $af    = if ($ColumnaDime) { "$($c["$ColumnaDime$f"])".Trim().ToUpper() } else { '' }
     $activa = ($r.ENCONTRADO -eq 'SI' -and $r.ACTIVA -eq 'SI')
 
     $comun = [ordered]@{
@@ -81,9 +87,9 @@ for ($f = 2; $f -le $ultima; $f++) {
         'CUMPLE 3 MESES'    = if ($vence) { $vence.ToString('yyyy-MM-dd') } else { '' }
         'DIAS PARA 3 MESES' = if ($vence) { [string][int](($vence - $Hoy).TotalDays) } else { '' }
         'ESTADO AC'         = if ($r.ESTADO) { $r.ESTADO } else { 'no existe en AC' }
-        'ESTADO DIME'       = $af
-        'ASESOR'            = "$($c["D$f"])".Trim()
-        'CC ASESOR'         = "$($c["C$f"])".Trim()
+        'ESTADO DIME'       = if ($ColumnaDime) { $af } else { '(no viene en el archivo)' }
+        'ASESOR'            = "$($c["$ColumnaAsesor$f"])".Trim()
+        'CC ASESOR'         = "$($c["$ColumnaCcAsesor$f"])".Trim()
         'TEAM LEADER'       = "$($c["Z$f"])".Trim()
         'CLIENTE'           = "$($c["M$f"])".Trim()
         'CEDULA CLIENTE'    = "$($c["K$f"])".Trim()
@@ -111,10 +117,21 @@ for ($f = 2; $f -le $ultima; $f++) {
     if ($activa) { continue }
 
     # --- NO ENCONTRADAS ---
+    # Una venta reciente que no aparece casi nunca esta caida: la portabilidad
+    # tarda dias habiles en aprovisionarse. Medido en este mismo consolidado el
+    # 23-sep: a 0-3 dias solo el 24% figura activa, a mas de 15 dias el 97%.
+    $diasVenta = if ($vta) { [int](($Hoy - $vta).TotalDays) } else { $null }
     if ($r.ENCONTRADO -ne 'SI') {
-        $o = [ordered]@{ 'QUE HACER' = $(if ($af -eq 'EXITOSO') {
+        $o = [ordered]@{ 'QUE HACER' = $(
+            if ($null -ne $diasVenta -and $diasVenta -le 7) {
+                "Venta de hace $diasVenta dias: casi seguro sigue en tramite, volver a consultar"
+            } elseif ($af -eq 'EXITOSO') {
                 'DIME la da por exitosa pero no existe en AC: buscar la orden de portabilidad'
-            } else { "DIME ya la marcaba $af : confirmar que no se activo" }) }
+            } elseif ($af) {
+                "DIME ya la marcaba $af : confirmar que no se activo"
+            } else {
+                'No existe en AC pese a tener dias: verificar si la venta se concreto'
+            }) }
         foreach ($k in $comun.Keys) { $o[$k] = $comun[$k] }
         $noEncontradas += [pscustomobject]$o
         continue
@@ -123,10 +140,13 @@ for ($f = 2; $f -le $ultima; $f++) {
     # --- NO ACTIVAS ---
     $vencida = ($vence -and $vence -le $Hoy)
     $suspend = ($r.ESTADO -match 'suspension')
-    $urg = if ($vencida) { '1 - YA VENCIO: cuota perdida' }
+    $urg = if ($null -ne $diasVenta -and $diasVenta -le 7) { '0 - VENTA RECIENTE: aun en tramite, no perseguir' }
+           elseif ($vencida) { '1 - YA VENCIO: cuota perdida' }
            elseif ($vence -and $vence -le $Hoy.AddDays(30)) { '2 - VENCE EN 30 DIAS' }
            else { '3 - Vence mas adelante' }
-    $que = if ($suspend) {
+    $que = if ($null -ne $diasVenta -and $diasVenta -le 7) {
+               "Venta de hace $diasVenta dias: la portabilidad tarda dias habiles, esperar"
+           } elseif ($suspend) {
                if ($vencida) { 'Suspendida y vencida: la cuota ya no se recupera' }
                else { 'Suspendida: si el cliente se pone al dia antes del vencimiento, se salva la cuota' }
            } else {
