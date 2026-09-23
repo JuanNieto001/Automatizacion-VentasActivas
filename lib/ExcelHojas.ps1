@@ -177,3 +177,49 @@ function Add-HojasAXlsx {
         Remove-Item -Recurse -Force -LiteralPath $tmp -ErrorAction SilentlyContinue
     }
 }
+
+function Rename-HojaXlsx {
+    <#  Cambia el nombre de una hoja, dejando el resto del libro igual.
+
+        Sirve para normalizar los consolidados: llegan unas veces con la hoja
+        principal llamada CONSOLIDADO y otras como Hoja1, y el entregable debe
+        verse igual todos los meses para que el tablero no tenga que adivinar.  #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Archivo,
+        [Parameter(Mandatory=$true)][string]$De,
+        [Parameter(Mandatory=$true)][string]$A,
+        [string]$Destino
+    )
+
+    if (-not (Test-Path -LiteralPath $Archivo)) { throw "No existe el libro: $Archivo" }
+    if (-not $Destino) { $Destino = $Archivo }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    $tmp = Join-Path $env:TEMP ("xlsxr_" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    try {
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($Archivo, $tmp)
+        $rutaWb = Join-Path $tmp 'xl\workbook.xml'
+        $wb = [xml](Get-Content -LiteralPath $rutaWb -Raw)
+
+        $nuevo = Get-NombreHojaValido $A
+        $hoja = $wb.workbook.sheets.sheet | Where-Object { $_.name -eq $De } | Select-Object -First 1
+        if (-not $hoja) { return [pscustomobject]@{ Archivo = $Destino; Cambio = $false; Motivo = "no existe la hoja '$De'" } }
+        if ($wb.workbook.sheets.sheet | Where-Object { $_.name -eq $nuevo }) {
+            return [pscustomobject]@{ Archivo = $Destino; Cambio = $false; Motivo = "ya existe una hoja '$nuevo'" }
+        }
+
+        $hoja.SetAttribute('name', $nuevo)
+        $wb.Save($rutaWb)
+
+        # definedNames y calcChain pueden referirse al nombre viejo
+        $cc = Join-Path $tmp 'xl\calcChain.xml'
+        if (Test-Path -LiteralPath $cc) { Remove-Item -LiteralPath $cc -Force }
+
+        if (Test-Path -LiteralPath $Destino) { Remove-Item -LiteralPath $Destino -Force }
+        Write-ZipOpc -Carpeta $tmp -Destino $Destino
+        return [pscustomobject]@{ Archivo = $Destino; Cambio = $true; Motivo = "'$De' -> '$nuevo'" }
+    } finally {
+        Remove-Item -Recurse -Force -LiteralPath $tmp -ErrorAction SilentlyContinue
+    }
+}

@@ -180,8 +180,32 @@ function Add-VerificacionAExcel {
         $filas = $doc.SelectNodes("//d:sheetData/d:row", $mgr)
         if (-not $filas -or $filas.Count -eq 0) { throw "La hoja '$($info.Nombre)' no tiene filas." }
 
-        # --- primera columna libre (se revisan TODAS las celdas, no solo las
-        #     que tienen valor: puede haber columnas solo con formato) ---
+        # --- primera columna libre ---
+        # Se toma la ultima columna CON ENCABEZADO, no la ultima celda del
+        # archivo. Algunos consolidados traen restos sueltos mucho mas a la
+        # derecha -el de septiembre del 23-sep tenia celdas hasta la BC aunque
+        # sus encabezados terminan en la AG- y midiendo por la ultima celda las
+        # columnas de verificacion caian en BD, lejos del resto y en una letra
+        # distinta a la de los demas meses.
+        #
+        # Si la fila de encabezados no se puede leer se vuelve al criterio
+        # anterior, que al menos garantiza no pisar datos.
+        $maxCab = 0
+        $filaCab = $filas | Where-Object { $_.GetAttribute("r") -eq '1' } | Select-Object -First 1
+        if ($filaCab) {
+            foreach ($c in $filaCab.ChildNodes) {
+                if ($c.LocalName -ne 'c') { continue }
+                $ref = $c.GetAttribute("r")
+                if ($ref -notmatch '^([A-Z]+)\d+$') { continue }
+                # solo cuenta si la celda tiene contenido
+                $tiene = $false
+                foreach ($h in $c.ChildNodes) { if ($h.LocalName -in @('v','is') -and "$($h.InnerText)".Trim()) { $tiene = $true } }
+                if (-not $tiene) { continue }
+                $i = Convert-ColumnaAIndice $matches[1]
+                if ($i -gt $maxCab) { $maxCab = $i }
+            }
+        }
+
         $maxCol = 0
         foreach ($f in $filas) {
             foreach ($c in $f.ChildNodes) {
@@ -193,6 +217,7 @@ function Add-VerificacionAExcel {
                 }
             }
         }
+        if ($maxCab -gt 0) { $maxCol = $maxCab }
 
         $encabezados = @('VERIFICACION', 'ESTADO AC', 'MOTIVO', 'FECHA VERIFICACION')
         $colsNuevas = @()
