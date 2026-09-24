@@ -99,10 +99,16 @@ function Test-PaqueteXlsx {
 
 function New-HojaXml {
     <#  Construye el XML de una hoja a partir de objetos, como cadenas en linea
-        (inlineStr) para no depender del sharedStrings del libro original.  #>
+        (inlineStr) para no depender del sharedStrings del libro original.
+
+        -Numericas lista las columnas que deben quedar como NUMERO y no como
+        texto. Importa: una columna de plata escrita como texto no se puede
+        sumar, ordenar ni filtrar por rango en Excel, que es justo lo que hay
+        que hacer con una cifra de deuda.  #>
     param(
         [Parameter(Mandatory=$true)][AllowEmptyCollection()][object[]]$Filas,
-        [Parameter(Mandatory=$true)][string[]]$Columnas
+        [Parameter(Mandatory=$true)][string[]]$Columnas,
+        [string[]]$Numericas = @()
     )
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.Append('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>')
@@ -111,7 +117,7 @@ function New-HojaXml {
     [void]$sb.Append('<row r="1">')
     for ($i = 0; $i -lt $Columnas.Count; $i++) {
         $ref = (Convert-IndiceAColumna ($i + 1)) + '1'
-        [void]$sb.Append('<c r="' + $ref + '" t="inlineStr"><is><t>' + (ConvertTo-XmlTexto $Columnas[$i]) + '</t></is></c>')
+        [void]$sb.Append('<c r="' + $ref + '" s="1" t="inlineStr"><is><t>' + (ConvertTo-XmlTexto $Columnas[$i]) + '</t></is></c>')
     }
     [void]$sb.Append('</row>')
 
@@ -121,8 +127,22 @@ function New-HojaXml {
         [void]$sb.Append('<row r="' + $n + '">')
         for ($i = 0; $i -lt $Columnas.Count; $i++) {
             $ref = (Convert-IndiceAColumna ($i + 1)) + $n
+            $val = $f.($Columnas[$i])
+            if ($Numericas -contains $Columnas[$i]) {
+                $d = 0.0
+                $limpio = ("$val" -replace '[^\d,.\-]', '') -replace ',', ''
+                if ($limpio -and [double]::TryParse($limpio, [ref]$d)) {
+                    [void]$sb.Append('<c r="' + $ref + '"><v>' +
+                                     $d.ToString([System.Globalization.CultureInfo]::InvariantCulture) + '</v></c>')
+                    continue
+                }
+                # si no es un numero se deja la celda vacia, no texto: asi no
+                # rompe las sumas ni los filtros por rango
+                [void]$sb.Append('<c r="' + $ref + '"/>')
+                continue
+            }
             [void]$sb.Append('<c r="' + $ref + '" t="inlineStr"><is><t>' +
-                             (ConvertTo-XmlTexto $f.($Columnas[$i])) + '</t></is></c>')
+                             (ConvertTo-XmlTexto $val) + '</t></is></c>')
         }
         [void]$sb.Append('</row>')
     }
@@ -186,7 +206,8 @@ function Add-HojasAXlsx {
 
         foreach ($h in $Hojas) {
             $nombre = Get-NombreHojaValido $h.Nombre
-            $xml = New-HojaXml -Filas @($h.Filas) -Columnas $h.Columnas
+            $num = if ($h.ContainsKey('Numericas')) { @($h.Numericas) } else { @() }
+            $xml = New-HojaXml -Filas @($h.Filas) -Columnas $h.Columnas -Numericas $num
 
             $existente = $wb.workbook.sheets.sheet | Where-Object { $_.name -eq $nombre } | Select-Object -First 1
             if ($existente) {

@@ -28,7 +28,10 @@ function New-XlsxSimple {
         [Parameter(Mandatory=$true)][object[]]$Filas,
         [Parameter(Mandatory=$true)][string[]]$Columnas,
         [Parameter(Mandatory=$true)][string]$Destino,
-        [string]$Hoja = 'Hoja1'
+        [string]$Hoja = 'Hoja1',
+        # Columnas que deben quedar como NUMERO. Una columna de plata escrita
+        # como texto no se puede sumar ni filtrar por rango en Excel.
+        [string[]]$Numericas = @()
     )
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -98,6 +101,18 @@ function New-XlsxSimple {
             for ($i = 0; $i -lt $Columnas.Count; $i++) {
                 $ref = (Convert-IndiceAColumna ($i + 1)) + $n
                 $val = $f.($Columnas[$i])
+                if ($Numericas -contains $Columnas[$i]) {
+                    $d = 0.0
+                    $limpio = ("$val" -replace '[^\d,.\-]', '') -replace ',', ''
+                    if ($limpio -and [double]::TryParse($limpio, [ref]$d)) {
+                        [void]$sb.Append('<c r="' + $ref + '"><v>' +
+                                         $d.ToString([System.Globalization.CultureInfo]::InvariantCulture) + '</v></c>')
+                    } else {
+                        # celda vacia, no texto: asi no rompe sumas ni filtros
+                        [void]$sb.Append('<c r="' + $ref + '"/>')
+                    }
+                    continue
+                }
                 [void]$sb.Append('<c r="' + $ref + '" t="inlineStr"><is><t>' +
                                  (ConvertTo-XmlTexto $val) + '</t></is></c>')
             }
