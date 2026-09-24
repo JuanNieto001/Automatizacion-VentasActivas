@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SINOPSIS
     Arma el listado de lineas suspendidas por no pago, pensado para decidir si
     a la empresa le conviene pagar la deuda del cliente.
@@ -7,7 +7,7 @@
     Claro paga cada venta de portabilidad en tres cuotas, y solo si la linea
     sigue activa a los tres meses. Cuando una linea se suspende por falta de
     pago, la venta se pierde... salvo que alguien pague. De ahi la pregunta de
-    negocio: ¿cuesta menos pagar la deuda que perder la venta?
+    negocio: cuesta menos pagar la deuda que perder la venta?
 
     Para responderla, cada fila trae lo que hace falta:
 
@@ -93,8 +93,20 @@ foreach ($n in $saldo.Keys) {
     $debe = $null
     if ($s.DEBE) { $t = 0.0; if ([double]::TryParse($s.DEBE, [ref]$t)) { $debe = $t } }
 
-    # Recomendacion: lo que decide es si todavia se puede salvar y cuanto cuesta
-    $rec = if ($s.EN_DEMANDA -eq 'SI') { 'NO PAGAR: la deuda esta en cobro juridico' }
+    # Recomendacion: lo que decide es si todavia se puede salvar y cuanto cuesta.
+    # El primer caso es el mejor y hay que distinguirlo: la linea ya volvio a
+    # estar activa, o sea que el cliente pago solo y la venta se salvo sin que
+    # la empresa gaste nada. Si no se separa, esas filas parecen pendientes.
+    $activa = ($s.ESTADO -and $s.ESTADO.Trim().ToUpper() -eq 'ACTIVO')
+    $rec = if ($activa -and $null -ne $debe -and $debe -le 0) {
+               'RESUELTA: pago y la linea esta activa, no hay que hacer nada'
+           }
+           elseif ($activa) {
+               # sigue debiendo pero todavia no la suspenden: no hay que pagarla
+               # hoy, pero puede caerse en cualquier momento
+               'ACTIVA CON DEUDA: vigilar, puede volver a suspenderse'
+           }
+           elseif ($s.EN_DEMANDA -eq 'SI') { 'NO PAGAR: la deuda esta en cobro juridico' }
            elseif ($s.CASTIGADA -eq 'SI') { 'NO PAGAR: deuda castigada, la venta no se recupera' }
            elseif ($null -eq $debe) { 'REVISAR A MANO: no se pudo leer el saldo en AC' }
            elseif ($debe -le 0) { 'NO DEBE NADA: revisar por que figura suspendida' }
@@ -109,6 +121,7 @@ foreach ($n in $saldo.Keys) {
              elseif ($rec -like 'HAY TIEMPO*') { 3 }
              elseif ($rec -like 'NO DEBE*') { 4 }
              elseif ($rec -like 'REVISAR*') { 5 }
+             elseif ($rec -like 'RESUELTA*') { 7 }
              else { 6 }
 
     $filas += [pscustomobject]@{
@@ -148,6 +161,11 @@ $filas | Group-Object 'QUE HACER' | Sort-Object { ($_.Group | Select-Object -Fir
     Write-Host ("  {0,-48} {1,4} lineas   `${2,12:N0}" -f $_.Name, $_.Count, $t)
 }
 $tot = ($filas | Where-Object { $null -ne $_.'CUANTO DEBE' } | Measure-Object 'CUANTO DEBE' -Sum).Sum
+$resueltas = @($filas | Where-Object { $_.'QUE HACER' -like 'RESUELTA*' })
+if ($resueltas.Count) {
+    Write-Host ""
+    Write-Host ("  {0} se resolvieron solas: el cliente pago y la linea volvio a estar activa." -f $resueltas.Count) -ForegroundColor Green
+}
 $salvables = @($filas | Where-Object { $_.'QUE HACER' -like 'DECIDIR HOY*' -or $_.'QUE HACER' -like 'EVALUAR*' -or $_.'QUE HACER' -like 'HAY TIEMPO*' })
 $totSalv = ($salvables | Where-Object { $null -ne $_.'CUANTO DEBE' } | Measure-Object 'CUANTO DEBE' -Sum).Sum
 Write-Host ""
@@ -165,3 +183,4 @@ $r = New-XlsxSimple -Filas $filas -Columnas $cols -Destino $Salida -Hoja 'SUSPEN
 Write-Host ""
 Write-Host ("Archivo: {0}" -f $r.Archivo) -ForegroundColor Cyan
 Write-Host ("  {0} filas, {1} columnas" -f $r.Filas, $r.Columnas)
+
