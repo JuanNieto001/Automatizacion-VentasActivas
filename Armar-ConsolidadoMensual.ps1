@@ -40,6 +40,12 @@ param(
     [string]$ColumnaAsesor = 'D',
     [string]$ColumnaCcAsesor = 'C',
     [string]$Salida,
+    # Una venta con menos de estos dias que no aparece activa NO se da por
+    # caida: la portabilidad tarda dias habiles en aprovisionarse, asi que
+    # todavia no se sabe. Esas van a la hoja EN TRAMITE, aparte de las que de
+    # verdad se cayeron. Medido el 05-oct: a 0-4 dias solo el 40% figura activa,
+    # a 5-7 dias el 87%, a mas de 15 dias el 97%.
+    [int]$DiasTramite = 7,
     [datetime]$Hoy = (Get-Date).Date
 )
 
@@ -68,7 +74,7 @@ foreach ($k in $c.Keys) { if ($k -match '^[A-Z]{1,2}(\d+)$') { $f=[int]$Matches[
 Write-Host ("Filas en la hoja $Hoja : {0}" -f ($ultima - 1))
 
 $base = [datetime]'1899-12-30'
-$noActivas = @(); $noEncontradas = @(); $cuota3 = @(); $sinResultado = 0
+$noActivas = @(); $noEncontradas = @(); $cuota3 = @(); $enTramite = @(); $sinResultado = 0
 
 for ($f = 2; $f -le $ultima; $f++) {
     $n = Digitos $c["$Columna$f"]; if ($n.Length -ne 10) { continue }
@@ -80,6 +86,8 @@ for ($f = 2; $f -le $ultima; $f++) {
     $vence = if ($vta) { $vta.AddMonths(3) } else { $null }
     $af    = if ($ColumnaDime) { "$($c["$ColumnaDime$f"])".Trim().ToUpper() } else { '' }
     $activa = ($r.ENCONTRADO -eq 'SI' -and $r.ACTIVA -eq 'SI')
+    $diasVenta = if ($vta) { [int](($Hoy - $vta).TotalDays) } else { $null }
+    $fresca = ($null -ne $diasVenta -and $diasVenta -le $DiasTramite)
 
     $comun = [ordered]@{
         'NUMERO'            = $n
@@ -106,9 +114,14 @@ for ($f = 2; $f -le $ultima; $f++) {
               elseif ($vence -le $Hoy) { '1 - ya cumplio' }
               elseif ($vence -le $Hoy.AddDays(30)) { '2 - cumple en 30 dias o menos' }
               else { '3 - cumple mas adelante' }
+    # Una venta fresca no activa no esta "en riesgo": todavia no se sabe, puede
+    # aparecer en cualquier momento. Se marca EN TRAMITE para no asustar al
+    # tablero con ventas que van bien.
     $estadoCuota = if (-not $vence) { 'SIN FECHA' }
-                   elseif ($vence -le $Hoy) { if ($activa) { 'COBRADA' } else { 'PERDIDA' } }
-                   else { if ($activa) { 'EN CAMINO' } else { 'EN RIESGO' } }
+                   elseif ($activa) { if ($vence -le $Hoy) { 'COBRADA' } else { 'EN CAMINO' } }
+                   elseif ($fresca) { 'EN TRAMITE' }
+                   elseif ($vence -le $Hoy) { 'PERDIDA' }
+                   else { 'EN RIESGO' }
     $o = [ordered]@{ 'ESTADO 3a CUOTA' = $estadoCuota; 'CUANDO CUMPLE' = $cuando
                      'ACTIVA HOY' = $(if ($activa) { 'SI' } else { 'NO' }) }
     foreach ($k in $comun.Keys) { $o[$k] = $comun[$k] }
@@ -116,16 +129,25 @@ for ($f = 2; $f -le $ultima; $f++) {
 
     if ($activa) { continue }
 
-    # --- NO ENCONTRADAS ---
-    # Una venta reciente que no aparece casi nunca esta caida: la portabilidad
-    # tarda dias habiles en aprovisionarse. Medido en este mismo consolidado el
-    # 23-sep: a 0-3 dias solo el 24% figura activa, a mas de 15 dias el 97%.
-    $diasVenta = if ($vta) { [int](($Hoy - $vta).TotalDays) } else { $null }
+    # --- EN TRAMITE ---
+    # Una venta reciente que no aparece activa NO esta caida: la portabilidad
+    # tarda dias habiles, asi que todavia no se sabe. Se saca de NO ACTIVAS y de
+    # NO ENCONTRADAS, donde parecia una venta perdida, y se deja aqui con lo
+    # unico cierto: hay que volver a consultarla.
+    if ($fresca) {
+        $o = [ordered]@{
+            'ESTADO HOY' = if ($r.ENCONTRADO -ne 'SI') { 'todavia no aparece en AC' } else { "en AC: $($r.ESTADO)" }
+            'QUE HACER'  = "Venta de hace $diasVenta dias: aun en tramite, volver a consultar en unos dias"
+        }
+        foreach ($k in $comun.Keys) { $o[$k] = $comun[$k] }
+        $enTramite += [pscustomobject]$o
+        continue
+    }
+
+    # --- NO ENCONTRADAS (ya con dias suficientes y aun no existe) ---
     if ($r.ENCONTRADO -ne 'SI') {
         $o = [ordered]@{ 'QUE HACER' = $(
-            if ($null -ne $diasVenta -and $diasVenta -le 7) {
-                "Venta de hace $diasVenta dias: casi seguro sigue en tramite, volver a consultar"
-            } elseif ($af -eq 'EXITOSO') {
+            if ($af -eq 'EXITOSO') {
                 'DIME la da por exitosa pero no existe en AC: buscar la orden de portabilidad'
             } elseif ($af) {
                 "DIME ya la marcaba $af : confirmar que no se activo"
@@ -137,16 +159,13 @@ for ($f = 2; $f -le $ultima; $f++) {
         continue
     }
 
-    # --- NO ACTIVAS ---
+    # --- NO ACTIVAS (existe en AC pero caida, con dias suficientes) ---
     $vencida = ($vence -and $vence -le $Hoy)
     $suspend = ($r.ESTADO -match 'suspension')
-    $urg = if ($null -ne $diasVenta -and $diasVenta -le 7) { '0 - VENTA RECIENTE: aun en tramite, no perseguir' }
-           elseif ($vencida) { '1 - YA VENCIO: cuota perdida' }
+    $urg = if ($vencida) { '1 - YA VENCIO: cuota perdida' }
            elseif ($vence -and $vence -le $Hoy.AddDays(30)) { '2 - VENCE EN 30 DIAS' }
            else { '3 - Vence mas adelante' }
-    $que = if ($null -ne $diasVenta -and $diasVenta -le 7) {
-               "Venta de hace $diasVenta dias: la portabilidad tarda dias habiles, esperar"
-           } elseif ($suspend) {
+    $que = if ($suspend) {
                if ($vencida) { 'Suspendida y vencida: la cuota ya no se recupera' }
                else { 'Suspendida: si el cliente se pone al dia antes del vencimiento, se salva la cuota' }
            } else {
@@ -164,12 +183,14 @@ if ($sinResultado -gt 0) {
 
 $noActivas     = @($noActivas     | Sort-Object URGENCIA, 'CUMPLE 3 MESES')
 $noEncontradas = @($noEncontradas | Sort-Object 'CUMPLE 3 MESES')
+$enTramite     = @($enTramite     | Sort-Object 'FECHA VENTA' -Descending)
 $cuota3        = @($cuota3        | Sort-Object 'CUANDO CUMPLE', 'ESTADO 3a CUOTA', 'FECHA VENTA')
 
 Write-Host ""
-Write-Host ("  NO ACTIVAS     : {0}" -f $noActivas.Count)
-Write-Host ("  NO ENCONTRADAS : {0}" -f $noEncontradas.Count)
-Write-Host ("  CUOTA 3        : {0}" -f $cuota3.Count)
+Write-Host ("  NO ACTIVAS (de verdad caidas) : {0}" -f $noActivas.Count)
+Write-Host ("  NO ENCONTRADAS (con dias)     : {0}" -f $noEncontradas.Count)
+Write-Host ("  EN TRAMITE (no se sabe aun)   : {0}" -f $enTramite.Count)
+Write-Host ("  CUOTA 3                       : {0}" -f $cuota3.Count)
 $cuota3 | Group-Object 'ESTADO 3a CUOTA' | Sort-Object Name | ForEach-Object {
     Write-Host ("      {0,-12} {1,5}" -f $_.Name, $_.Count)
 }
@@ -177,6 +198,7 @@ $cuota3 | Group-Object 'ESTADO 3a CUOTA' | Sort-Object Name | ForEach-Object {
 $hojas = @()
 if ($noActivas.Count)     { $hojas += @{ Nombre='NO ACTIVAS';     Filas=$noActivas;     Columnas=@($noActivas[0].PSObject.Properties.Name) } }
 if ($noEncontradas.Count) { $hojas += @{ Nombre='NO ENCONTRADAS'; Filas=$noEncontradas; Columnas=@($noEncontradas[0].PSObject.Properties.Name) } }
+if ($enTramite.Count)     { $hojas += @{ Nombre='EN TRAMITE';     Filas=$enTramite;     Columnas=@($enTramite[0].PSObject.Properties.Name) } }
 if ($cuota3.Count)        { $hojas += @{ Nombre='CUOTA 3';        Filas=$cuota3;        Columnas=@($cuota3[0].PSObject.Properties.Name) } }
 if (-not $hojas.Count) { throw "No hay nada que agregar." }
 
