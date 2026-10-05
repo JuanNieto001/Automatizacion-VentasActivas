@@ -86,7 +86,14 @@ for ($f = 2; $f -le $ultima; $f++) {
     $vence = if ($vta) { $vta.AddMonths(3) } else { $null }
     $af    = if ($ColumnaDime) { "$($c["$ColumnaDime$f"])".Trim().ToUpper() } else { '' }
     $activa = ($r.ENCONTRADO -eq 'SI' -and $r.ACTIVA -eq 'SI')
-    $diasVenta = if ($vta) { [int](($Hoy - $vta).TotalDays) } else { $null }
+    # "Fresca" se mide contra la fecha en que SE CONSULTO, no contra hoy: una
+    # venta que estaba en tramite cuando la miramos sigue siendo "no se sabe",
+    # aunque hoy ya tenga dias. Si el CSV no trae CONSULTADO, se usa Hoy.
+    $refFecha = $Hoy
+    if ($r.PSObject.Properties.Name -contains 'CONSULTADO' -and $r.CONSULTADO) {
+        try { $refFecha = ([datetime]$r.CONSULTADO).Date } catch { }
+    }
+    $diasVenta = if ($vta) { [int](($refFecha - $vta).TotalDays) } else { $null }
     $fresca = ($null -ne $diasVenta -and $diasVenta -le $DiasTramite)
 
     $comun = [ordered]@{
