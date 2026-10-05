@@ -202,7 +202,16 @@ if ($enTramite.Count)     { $hojas += @{ Nombre='EN TRAMITE';     Filas=$enTrami
 if ($cuota3.Count)        { $hojas += @{ Nombre='CUOTA 3';        Filas=$cuota3;        Columnas=@($cuota3[0].PSObject.Properties.Name) } }
 if (-not $hojas.Count) { throw "No hay nada que agregar." }
 
-$r2 = Add-HojasAXlsx -Origen $Verificado -Destino $Salida -Hojas $hojas
+# El entregable sale siempre con la misma estructura: la hoja de datos
+# (CONSOLIDADO) mas las pestanas que agregamos. Se quitan las hojas de trabajo
+# que arrastra cada consolidado de origen (RECHAZOS, ESTADO, GRABADO, EXITOSO,
+# PLANES, Hoja1, etc.), que cambian de un mes a otro y ensucian el archivo.
+$limpio = Join-Path $env:TEMP ("consolidado_limpio_" + [Guid]::NewGuid().ToString('N') + '.xlsx')
+$sel = Select-HojasXlsx -Archivo $Verificado -Conservar @($Hoja) -Destino $limpio
+if ($sel.Quitadas.Count) { Write-Host ("Se quitan del entregable las hojas de trabajo: {0}" -f ($sel.Quitadas -join ', ')) -ForegroundColor Gray }
+
+$r2 = Add-HojasAXlsx -Origen $limpio -Destino $Salida -Hojas $hojas
+Remove-Item -LiteralPath $limpio -Force -ErrorAction SilentlyContinue
 Write-Host ""
 Write-Host ("Entregable: {0}" -f $r2.Archivo) -ForegroundColor Cyan
 Write-Host ("  hojas agregadas: {0}" -f ($r2.Agregadas -join ', '))

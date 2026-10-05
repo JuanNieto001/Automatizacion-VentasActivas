@@ -18,6 +18,93 @@
 
 . "$PSScriptRoot\ExcelNuevo.ps1"
 
+function Select-HojasXlsx {
+    <#  Deja en el libro SOLO las hojas indicadas y quita las demas.
+
+        Sirve para que el entregable salga siempre con la misma estructura
+        -la hoja de datos mas las pestanas que agregamos- sin arrastrar las
+        hojas de trabajo que trae cada consolidado de origen (RECHAZOS, ESTADO,
+        GRABADO, EXITOSO, PLANES, Hoja1, etc.), que cambian de un mes a otro.
+
+        Quitar una hoja obliga a tocar las mismas cuatro partes que agregarla,
+        mas el .rels propio de la hoja si lo tiene; si algo queda a medias Excel
+        da el archivo por danado. Al final se valida con Test-PaqueteXlsx.  #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Archivo,
+        [Parameter(Mandatory=$true)][string[]]$Conservar,
+        [string]$Destino
+    )
+
+    if (-not (Test-Path -LiteralPath $Archivo)) { throw "No existe el libro: $Archivo" }
+    if (-not $Destino) { $Destino = $Archivo }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    $tmp = Join-Path $env:TEMP ("xlsxs_" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    try {
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($Archivo, $tmp)
+        $rutaWb   = Join-Path $tmp 'xl\workbook.xml'
+        $rutaRels = Join-Path $tmp 'xl\_rels\workbook.xml.rels'
+        $rutaCt   = Join-Path $tmp '[Content_Types].xml'
+        $wb   = [xml](Get-Content -LiteralPath $rutaWb -Raw)
+        $rels = [xml](Get-Content -LiteralPath $rutaRels -Raw)
+        $ct   = [xml](Get-Content -LiteralPath $rutaCt -Raw)
+        $nsR  = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+
+        $ridTarget = @{}
+        foreach ($rel in $rels.Relationships.Relationship) { $ridTarget[$rel.Id] = $rel.Target }
+
+        $quitadas = @()
+        foreach ($h in @($wb.workbook.sheets.sheet)) {
+            if ($Conservar -contains $h.name) { continue }
+            $quitadas += $h.name
+            $rid = $h.GetAttribute('id', $nsR)
+            $target = $ridTarget[$rid]       # p.ej. worksheets/sheet3.xml
+
+            # 1. archivo de la hoja y su _rels
+            if ($target) {
+                $archHoja = Join-Path $tmp ('xl\' + ($target -replace '/', '\'))
+                if (Test-Path -LiteralPath $archHoja) { Remove-Item -LiteralPath $archHoja -Force }
+                $relHoja = Join-Path (Split-Path $archHoja) ('_rels\' + (Split-Path $archHoja -Leaf) + '.rels')
+                if (Test-Path -LiteralPath $relHoja) { Remove-Item -LiteralPath $relHoja -Force }
+                # 2. su Override en Content_Types
+                $part = '/xl/' + $target
+                $ov = $ct.Types.Override | Where-Object { $_.PartName -eq $part }
+                if ($ov) { [void]$ct.Types.RemoveChild($ov) }
+            }
+            # 3. la relacion
+            $rel = $rels.Relationships.Relationship | Where-Object { $_.Id -eq $rid }
+            if ($rel) { [void]$rels.Relationships.RemoveChild($rel) }
+            # 4. el nodo <sheet>
+            [void]$h.ParentNode.RemoveChild($h)
+        }
+
+        # definedNames que apunten a una hoja quitada: se eliminan
+        if ($wb.workbook.definedNames) {
+            foreach ($dn in @($wb.workbook.definedNames.definedName)) {
+                foreach ($q in $quitadas) {
+                    if ($dn.'#text' -and ($dn.'#text' -like "*'$q'!*" -or $dn.'#text' -like "*$q!*")) {
+                        [void]$dn.ParentNode.RemoveChild($dn); break
+                    }
+                }
+            }
+        }
+
+        $wb.Save($rutaWb); $rels.Save($rutaRels); $ct.Save($rutaCt)
+        [void](Remove-ParteCalcChain -Tmp $tmp)
+
+        if (Test-Path -LiteralPath $Destino) { Remove-Item -LiteralPath $Destino -Force }
+        Write-ZipOpc -Carpeta $tmp -Destino $Destino
+
+        $rotas = Test-PaqueteXlsx -Archivo $Destino
+        if ($rotas.Count) { throw ("El libro quedo con relaciones rotas: " + ($rotas -join '; ')) }
+
+        return [pscustomobject]@{ Archivo = $Destino; Quitadas = $quitadas; Conservadas = @($Conservar | Where-Object { $quitadas -notcontains $_ }) }
+    } finally {
+        Remove-Item -Recurse -Force -LiteralPath $tmp -ErrorAction SilentlyContinue
+    }
+}
+
 function Get-NombreHojaValido {
     <#  Excel no admite : \ / ? * [ ] en el nombre, ni mas de 31 caracteres.  #>
     param([Parameter(Mandatory=$true)][string]$Nombre)
